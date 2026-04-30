@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Model Viewer & Inspector</title>
+    <style>
+        :root {
+            --bg-color: #1a1a1a;
+            --panel-bg: #2c2c2c;
+            --text-color: #f0f0f0;
+            --border-color: #444;
+            --primary-color: #007bff;
+        }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+        canvas {
+            display: block;
+            flex-grow: 1;
+        }
+        #info-panel {
+            width: 350px;
+            flex-shrink: 0;
+            background-color: var(--panel-bg);
+            border-right: 1px solid var(--border-color);
+            padding: 20px;
+            box-sizing: border-box;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+        }
+        h1, h2 {
+            margin-top: 0;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+            font-weight: 300;
+        }
+        h2 {
+            margin-top: 20px;
+            font-size: 1.2em;
+        }
+        ul {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+            flex-grow: 1;
+            overflow-y: auto;
+            background-color: #222;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+        }
+        li {
+            padding: 8px 10px;
+            border-bottom: 1px solid #3a3a3a;
+            font-family: monospace;
+            font-size: 0.9em;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        li:hover { background-color: #383838; }
+        li.selected { background-color: var(--primary-color); }
+        
+        #status {
+            padding: 10px;
+            background-color: rgba(0,0,0,0.3);
+            border-radius: 4px;
+            margin-top: 15px;
+            text-align: center;
+        }
+        input[type="file"] {
+            background-color: #333;
+            border: 1px solid #555;
+            padding: 1rem;
+            border-radius: 4px;
+            width: 100%;
+            box-sizing: border-box;
+            cursor: pointer;
+            margin: 10px 0;
+        }
+        .control-group {
+            margin-top: 15px;
+        }
+        .control-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 0.9em;
+        }
+        .control-group input[type="range"] {
+            width: 100%;
+        }
+        #bone-inspector {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+        }
+        #bone-inspector h2 {
+            margin-top: 0;
+            font-size: 1.1em;
+        }
+        #selected-bone-name {
+            font-family: monospace;
+            color: #a5d6ff;
+        }
+    </style>
+</head>
+<body>
+    <div id="info-panel">
+        <h1>Model Bone Inspector</h1>
+        <p>Load a .glb or .fbx model to view and inspect its bones.</p>
+        <input type="file" id="model-input" accept=".glb,.fbx">
+        
+        <div class="control-group">
+            <label for="model-scale-slider">Model Scale</label>
+            <input type="range" id="model-scale-slider" min="0.01" max="5" value="1" step="0.01">
+        </div>
+
+        <div id="bone-inspector" style="display: none;">
+            <h2>Bone Inspector</h2>
+            <p>Selected: <strong id="selected-bone-name">-</strong></p>
+            <div class="control-group">
+                <label>Rotation X</label>
+                <input type="range" class="rotation-slider" data-axis="x" min="-180" max="180" value="0">
+            </div>
+            <div class="control-group">
+                <label>Rotation Y</label>
+                <input type="range" class="rotation-slider" data-axis="y" min="-180" max="180" value="0">
+            </div>
+            <div class="control-group">
+                <label>Rotation Z</label>
+                <input type="range" class="rotation-slider" data-axis="z" min="-180" max="180" value="0">
+            </div>
+        </div>
+
+        <h2>All Bones Found</h2>
+        <ul id="all-bones-ul">
+            <li>Load a model to see its bones.</li>
+        </ul>
+
+        <div id="status">Ready</div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const statusEl = document.getElementById('status');
+        const allBonesEl = document.getElementById('all-bones-ul');
+        const modelInput = document.getElementById('model-input');
+        const scaleSlider = document.getElementById('model-scale-slider');
+        const boneInspectorEl = document.getElementById('bone-inspector');
+        const selectedBoneNameEl = document.getElementById('selected-bone-name');
+        const rotationSliders = document.querySelectorAll('.rotation-slider');
+
+        let scene, camera, renderer, controls, model;
+        let allBoneObjects = {};
+        let selectedBone = null;
+
+        function initScene() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x111111);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 1.5, 2);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            document.body.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.target.set(0, 1, 0);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+            directionalLight.position.set(5, 10, 7.5);
+            scene.add(directionalLight);
+
+            const floor = new THREE.Mesh(
+                new THREE.PlaneGeometry(10, 10),
+                new THREE.MeshStandardMaterial({ color: 0x444444, side: THREE.DoubleSide })
+            );
+            floor.rotation.x = -Math.PI / 2;
+            scene.add(floor);
+
+            onWindowResize();
+            animate();
+        }
+
+        modelInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const objectURL = URL.createObjectURL(file);
+            const extension = file.name.split('.').pop().toLowerCase();
+            const loader = extension === 'fbx' ? new FBXLoader() : new GLTFLoader();
+            
+            statusEl.textContent = 'Loading...';
+            boneInspectorEl.style.display = 'none';
+            allBonesEl.innerHTML = '<li>Loading...</li>';
+            selectedBone = null;
+
+            loader.load(objectURL,
+                (loadedModel) => {
+                    if (model) scene.remove(model);
+                    model = extension === 'fbx' ? loadedModel : loadedModel.scene;
+                    model.scale.set(scaleSlider.value, scaleSlider.value, scaleSlider.value);
+                    scene.add(model);
+                    statusEl.textContent = 'Model loaded successfully!';
+
+                    allBoneObjects = {};
+                    model.traverse(node => {
+                        if (node.isBone) {
+                            allBoneObjects[node.name] = node;
+                        }
+                    });
+
+                    const boneNames = Object.keys(allBoneObjects).sort();
+                    allBonesEl.innerHTML = '';
+                    if (boneNames.length > 0) {
+                        boneNames.forEach(boneName => {
+                            const li = document.createElement('li');
+                            li.textContent = boneName;
+                            li.addEventListener('click', () => selectBone(boneName));
+                            allBonesEl.appendChild(li);
+                        });
+                    } else {
+                        allBonesEl.innerHTML = '<li>No bones found in model.</li>';
+                    }
+                },
+                (xhr) => {
+                    const percentLoaded = Math.round((xhr.loaded / xhr.total) * 100);
+                    statusEl.textContent = `Loading: ${percentLoaded}%`;
+                },
+                (error) => {
+                    console.error('An error happened while loading the model:', error);
+                    statusEl.textContent = 'Error loading model. Check console.';
+                    allBonesEl.innerHTML = '<li>Could not load model.</li>';
+                }
+            );
+        });
+
+        function selectBone(boneName) {
+            selectedBone = allBoneObjects[boneName];
+            if (!selectedBone) return;
+
+            // Highlight in list
+            document.querySelectorAll('#all-bones-ul li').forEach(li => {
+                li.classList.toggle('selected', li.textContent === boneName);
+            });
+
+            selectedBoneNameEl.textContent = boneName;
+            boneInspectorEl.style.display = 'block';
+
+            // Update sliders to match bone's current rotation
+            rotationSliders.forEach(slider => {
+                const axis = slider.dataset.axis;
+                slider.value = THREE.MathUtils.radToDeg(selectedBone.rotation[axis]);
+            });
+        }
+
+        scaleSlider.addEventListener('input', () => {
+            if (model) {
+                const scale = parseFloat(scaleSlider.value);
+                model.scale.set(scale, scale, scale);
+            }
+        });
+
+        rotationSliders.forEach(slider => {
+            slider.addEventListener('input', () => {
+                if (selectedBone) {
+                    const axis = slider.dataset.axis;
+                    const degrees = parseFloat(slider.value);
+                    selectedBone.rotation[axis] = THREE.MathUtils.degToRad(degrees);
+                }
+            });
+        });
+
+        function onWindowResize() {
+            const panelWidth = document.getElementById('info-panel').offsetWidth;
+            const viewWidth = window.innerWidth - panelWidth;
+            camera.aspect = viewWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(viewWidth, window.innerHeight);
+        }
+        window.addEventListener('resize', onWindowResize);
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        
+        initScene();
+    </script>
+</body>
+</html>
