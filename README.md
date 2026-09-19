@@ -1,96 +1,171 @@
-# CameraCharacter: Real-Time Vision-Driven 3D Avatars
+# CameraCharacter
 
-## 🌟 Overview
+Inhabit a 3D character from a webcam. Drop in a rigged humanoid model (Meshy, Mixamo, VRoid/VRM, Rigify, UE5, Character Creator…), stand in front of the camera, and the character moves with you. Everything runs in the browser: pose tracking (MediaPipe Tasks Vision), automatic bone mapping, retargeting, a mirror-style virtual camera, and recording of takes as re-targetable landmark data, GLB animation assets, BVH, or video.
 
-**CameraCharacter** is an open-source, low-latency motion capture and puppet system. It enables anyone with a standard webcam to animate a fully rigged 3D humanoid avatar in real-time, without the need for specialized depth cameras (like Kinect) or expensive inertial MoCap suits.
+Intended uses: interactive art installations, quick character puppeteering, motion-capture recording for animation, and recording actor performances inside a 3D scene as a 3D asset.
 
-By leveraging Google's **MediaPipe** for high-fidelity pose estimation and **Three.js** for browser-based 3D rendering, this project bridges the gap between raw computer vision and interactive character animation.
+> Status: version 2 is a ground-up rebuild of an earlier prototype. The design is documented in [`docs/DESIGN.md`](docs/DESIGN.md); decisions and their provenance are in [`decisionlog.md`](decisionlog.md).
 
----
+## What it does
 
-## 🚀 Why Use This?
+- **Automatic bone mapping.** Rigs are analysed by name *and* by skeleton topology, so Mixamo's `mixamorig:LeftForeArm`, Meshy's `Spine02 → Spine01 → Spine` (named upside down), UE5's `lowerarm_l`, Rigify's `DEF-forearm.L`, VRoid's `J_Bip_L_LowerArm` and nameless Blender rigs all resolve to the same humanoid roles. The mapping is shown with a confidence per bone and can be corrected live.
+- **Rest-pose-aware retargeting.** Rotations are applied as world-space deltas from the rig's *bind pose*, so it does not matter whether a rig's bones point along +X, +Y, or something odd, nor whether the bind pose is a T-pose, an A-pose, or relaxed. Each bone gets a full 3-axis orientation from landmark triplets (elbow bend plane, palm normal, foot direction…), which removes the limb twisting that direction-only retargeting produces.
+- **Graceful degradation.** Every body part has a confidence with hysteresis. When you walk up to the camera and only your upper body is visible, the legs settle to rest while the torso, arms and head keep animating; lost elbows are filled in by a two-bone solve; nothing snaps to a T-pose.
+- **Mirror camera.** The virtual camera frames the character the way the webcam frames you: full body when you stand back, head-and-shoulders when you lean in, continuously and smoothly.
+- **Calibration that is automatic first.** Rig analysis at load time chooses per-bone reference modes; an optional three-second pose calibration refines them for stylized rigs; a one-click diagnostic snapshot (side-by-side image plus JSON) lets a developer or an LLM diagnose a new rig family.
+- **Recording.** Raw landmark takes (`.mocap.json`) that can be replayed and re-targeted onto any model later; retargeted animation exported as a GLB with the model (and optionally the scene) embedded; BVH for Blender/Maya/MotionBuilder; WebM video of the viewport.
+- **No server required.** Optional Python provider for OpenCV-based pipelines, other cameras, or a second machine, speaking the same protocol over WebSocket.
 
--   **Accessibility**: Use the hardware you already own. No sensors, no suits—just a camera.
--   **Decoupled Architecture**: The project separates the intensive AI processing (Python) from the visual rendering (JavaScript/WebGL). This allows the backend to run on a dedicated machine or locally while keeping the frontend lightweight and portable.
--   **Live Retargeting**: Unlike static animation playback, this system calculates bone rotations on-the-fly. You can swap models, adjust offsets, and fix limb inversions without restarting the stream.
--   **Creative Expression**: Includes a variety of 'Visual Modes' (Matrix, Neon, Punk, Comic) for the backend feed, making it a powerful tool for streamers and digital performers.
+## Quick start
 
----
+Requirements: Node.js 20+, a Chromium-based browser or Firefox with WebGL2, a webcam.
 
-## 🏗️ System Architecture & Data Pipeline
+```bash
+npm install
+npm run dev
+```
 
-### 1. The Backend (Python)
--   **Capture**: Uses OpenCV to stream frames from any detected webcam.
--   **Processing**: MediaPipe Holistic processes each frame to identify 33 3D 'World Landmarks' (X, Y, Z in metric space) and facial geometry.
--   **The Pipeline**: The backend calculates mouth openness (ratio-based) and packages all coordinate data into a compact JSON payload.
--   **Communication**: A high-speed WebSocket server (`websockets` library) broadcasts this data to any connected client at ~30 FPS.
+Open the printed URL (default `http://localhost:5173`), allow camera access, and either use the bundled sample character or drop a `.glb`, `.gltf`, `.fbx` or `.vrm` file onto the window. Stand back so your whole body is visible for the best result; the character follows immediately.
 
-### 2. The Frontend (Three.js)
--   **Reception**: Connects to the local WebSocket and parses the landmark stream.
--   **Coordinate Translation**: MediaPipe uses a Y-down coordinate system, while Three.js uses Y-up. The frontend automatically normalizes this data.
--   **Retargeting Engine**: Using a series of mathematical operations (Vector math, Quaternions, and Matrix4 rotations), the system aligns the 'bones' of a loaded 3D model with the vectors formed by the human user's limbs.
--   **UI & Mapping**: Provides a robust interface to load `.glb` or `.fbx` models, map specific bones to tracking roles, and save these configurations to `localStorage`.
+No webcam? Choose **Source → Synthetic** to drive the character from generated motion (walk, squat, wave, close-up…), or load a recorded `.mocap.json` take.
 
----
+### Optional: Python pose provider
 
-## 🛠️ Installation & Setup
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r backend/requirements.txt
+python backend/stream_pose.py --camera 0 --preview
+```
 
-### Prerequisites
--   Python 3.9+
--   A modern web browser (Chrome or Edge recommended for WebGL performance)
+Then in the app choose **Source → WebSocket** and connect to `ws://localhost:8765`. See [`backend/README.md`](backend/README.md).
 
-### Step 1: Backend Setup
-1.  Navigate to the project root.
-2.  Install dependencies:
-    ```bash
-    pip install -r requirements.txt
-    ```
-3.  Run the backend:
-    ```bash
-    python backend/main.py
-    ```
-    *This will open a GUI window where you can select your camera and apply filters.*
+## How it works
 
-### Step 2: Frontend Setup
-1.  Open `frontend/index.html` in your browser.
-2.  Ensure the status light for **WebSocket** turns green (indicating it has connected to the Python backend).
-3.  Upload a rigged humanoid `.glb` or `.fbx` file.
+```
+Webcam ─▶ MediaPipe PoseLandmarker ─▶ PoseFrame ─▶ filters ─▶ body model ─▶ retargeter ─▶ rig bones
+          (+ optional hands, face)     (33 world +   (One Euro,  (per-bone     (world-delta
+                                        33 image      hysteresis, direction +   from bind pose,
+                                        landmarks)    mirror)     up reference) degradation)
+                                                                                     │
+                                Stage: scene, lights, mirror camera, environment ◀───┘
+                                Recorders: landmark take · animation clip → GLB/BVH · video
+                                Diagnostics: overlay, per-bone error, snapshot bundle
+```
 
---- 
+### Coordinate conventions
 
-## 🎮 Core Features
+MediaPipe reports world landmarks in meters relative to the hip midpoint with image conventions (x right, y down, z toward the camera negative). They are converted to three.js (x, −y, −z). A person facing the camera then has their anatomical left at +X and faces +Z, which is exactly how a glTF humanoid stands, so the un-mirrored "actor" mapping drives the character's left arm from your left arm. **Mirror mode** (default) negates X and swaps left/right so the character behaves like a mirror. MediaPipe always runs on the un-flipped frame so its left/right labels stay correct; only the preview is flipped.
 
--   **Dynamic Bone Mapping**: Manually assign which model bone corresponds to the 'Left Upper Arm', 'Hips', etc. Works with various rigging naming conventions (Mixamo, Blender, Rigify).
--   **Retargeting Offsets**: Every model is rigged differently. If your character's head is looking at the floor while you are looking forward, use the **Head Offset** sliders to calibrate the rotation in real-time.
--   **Limb Inversion Fixes**: Models can have different local axes for bones. If an arm bends backward, use the **Inversion Selectors** to flip the X, Y, or Z axis for that specific limb group.
--   **Dual-View Monitoring**: 
-    -   **Main View**: The fully rendered 3D avatar.
-    -   **Pose Input View**: A live 'stick-figure' representation of the raw data being received from the backend, essential for troubleshooting occlusion or lighting issues.
--   **Tracking Dashboard**: Real-time status lights indicate which body parts have high enough tracking confidence (visibility) to animate.
+### Automatic bone mapping
 
----
+Two detectors run independently and are reconciled:
 
-## ⚠️ Current Issues & Challenges
+1. **Names.** Bone names are normalized (namespace prefixes such as `mixamorig:`, `DEF-`, `J_Bip_L_`, `CC_Base_` stripped; camelCase/snake/dot split; side tokens detected) and matched against a synonym lexicon per role.
+2. **Topology.** From the bind pose, the hips are found as the joint whose subtree splits into two mirrored downward chains (legs) and one upward chain (spine); the spine chain ends at the first joint that owns two sideways chains (arms) and a head chain; chains are then labelled in order (shoulder, upper arm, lower arm, hand; upper leg, lower leg, foot, toes). Helper bones (twist, IK, hair, skirt, props) are excluded.
 
--   **Rotational Accuracy**: Because MediaPipe provides point coordinates (landmarks) rather than rotational orientation (quaternions) for joints, rotations must be inferred. This can lead to "flipping" or jank if the user's arm is perfectly aligned with the camera (loss of depth perspective).
--   **Model Squashing**: If the user moves too close to the camera, the hip tracking might incorrectly interpret the scale, causing the model to "squash." (Current workaround: Disable 'Track Hip Position' in the settings).
--   **Occlusion**: If a hand moves behind the back, the confidence score drops, and the limb will "freeze" or snap back to the T-Pose until visible again.
--   **Head Twist**: Complex head rotations (tilting + nodding + turning) are difficult to solve with only ear/eye/shoulder points.
+When both agree the confidence is high; topology decides spine order and sides, names decide shoulder-versus-upper-arm and fingers. The result is a **rig profile** (mapping, confidences, warnings, rest analysis, per-bone settings) stored per skeleton fingerprint in the browser and exportable as JSON.
 
----
+### Retargeting
 
-## 🗺️ Future Roadmap
+For each bone the body model produces a measured basis: a direction (e.g. shoulder → elbow) and an up reference (e.g. the elbow's bend direction, the back of the hand, the foot's forward direction) with a confidence. The rig analysis produces a reference basis for the same bone in the model's bind pose. The solver computes the world rotation taking the reference basis to the measured basis and applies it on top of the bone's bind-pose world orientation, converting to the bone's local space through a solver-maintained parent chain. Bones are solved parents first; unmapped intermediate bones follow their parents. Rotations are smoothed with a velocity-adaptive slerp; twist is damped when the up reference is uncertain.
 
-1.  **Inverse Kinematics (IK) Integration**: Move from simple forward-kinematics (vector-based) to a full IK solver to ensure feet stay planted on the floor and limbs move more naturally.
-2.  **VRM Support**: Better integration for `.vrm` files, including support for SpringBones (hair/clothing physics) and BlendShape-based facial expressions.
--   **Advanced Face Tracking**: Transition from simple mouth openness to a full 52-shape ARKit blendshape mapping (eye blinking, eyebrow raising, sneering).
--   **Recording & Playback**: The ability to record the raw landmark stream to a file and play it back later to render animations without a live actor.
--   **Multi-User Support**: Allowing the backend to track multiple people and transmit data for multiple avatars simultaneously.
+Reference modes per bone:
 
----
+| mode | reference | use |
+|---|---|---|
+| `auto` | the model's bind-pose direction | standard rigs (T-pose, A-pose, relaxed) |
+| `relative` | a canonical human standing rest | stylized rigs whose bones are not anatomical; the model shows its own rest pose when you stand normally and your motion is applied as a delta |
+| `calibrated` | measured from you while matching the model's rest pose | escape hatch for unusual rigs or systematic tracking bias |
 
-## 🤝 Contributing
+The rig analysis picks `auto` for bones whose bind-pose direction lies inside an anatomical cone and `relative` otherwise; both are overridable, and a roll trim per bone corrects residual twist.
 
-This project is in active development. If you encounter "janky" movements or have ideas for better rotation math, please contribute! 
+### Degradation and the mirror camera
 
-**Special Note on 3D Models**: For best results, use models from [Adobe Mixamo](https://www.mixamo.com/) as they follow a standard rigging structure that the default mapping handles well.
+Landmark visibilities are smoothed and gated with hysteresis (on above 0.65, off below 0.45, 250 ms hold). A bone whose landmarks are lost holds its pose briefly, then relaxes toward rest. Lost elbows or knees are reconstructed from the shoulder/hip and wrist/ankle with the model's bone lengths. When legs leave the frame the hips stop translating vertically. The status panel shows which parts are tracked.
+
+In mirror camera mode the app measures which part of your body is visible in the image, finds the corresponding heights on the character, and drives the camera distance and target with critically damped springs so the character fills the viewport the way you fill the webcam frame.
+
+### Calibration
+
+1. **Rig auto-calibration** on every load (no user action): mapping, bind-pose analysis, unit and facing correction, per-bone mode selection.
+2. **Pose calibration** (optional, about three seconds): the character shows its rest pose next to the webcam preview; you match it, a countdown runs, and the averaged reference bases are stored for you.
+3. **Diagnostic snapshot**: one click captures the webcam frame with landmarks, the 3D view with the measured skeleton overlaid, per-bone error bars, and a JSON bundle (profile, mapping with confidences, rest directions, measured bases, solved directions, settings, versions). Hand it to a developer or paste it to an LLM to diagnose mapping or roll problems on a new rig family; fixes land as lexicon entries, presets, or profile tweaks. This is a development-time loop, not a runtime dependency.
+
+The app also self-checks: after solving, the angle between each measured direction and the bone's actual direction is reported, and bones over 5° are highlighted.
+
+## Supported models
+
+| source | format | notes |
+|---|---|---|
+| Mixamo | FBX, GLB | `mixamorig:` prefix, T-pose bind, centimeters (FBX). Fingers supported. |
+| Meshy | GLB | A-pose-ish bind with bent elbows; spine chain named in reverse; some stub bones (handled with `relative` mode). Sample bundled. |
+| VRoid / VRM 0.x and 1.0 | VRM | Humanoid map read from the VRM metadata; VRM 0.x rotated to face +Z. |
+| Rigify (Blender) | GLB | `DEF-` bones used; `ORG-`/`MCH-` ignored. |
+| UE5 Mannequin | FBX, GLB | `pelvis`, `spine_01…05`, `upperarm_l`… twist bones ignored. |
+| Character Creator 4 | FBX | `CC_Base_*` names; twist bones ignored. |
+| Daz Genesis | FBX | Bend/Twist pairs handled. |
+| Generic Blender | GLB, FBX | `upper_arm.L`, or nameless `Bone.001…` rigs via topology. |
+
+Any humanoid with hips, a spine, a head, two arms and two legs can be driven. Missing optional bones (shoulders, neck, feet, toes, fingers) are fine.
+
+## Recording and export
+
+| output | contents | use |
+|---|---|---|
+| `.mocap.json` | raw PoseFrame v2 stream (world + image landmarks, optional hands/face), timestamps, capture info | replay, re-target onto another model, archive a take losslessly |
+| `.glb` | the model with the retargeted animation clip embedded (optionally with the loaded environment) | a self-contained "3D video" asset for Blender, Unity, Unreal, three.js, any glTF viewer |
+| `.bvh` | humanoid hierarchy with rest offsets, root position + per-joint rotation channels | DCC mocap import (Blender, Maya, MotionBuilder) |
+| `.webm` | viewport video (optional webcam picture-in-picture) | sharing, previews |
+
+## Protocol
+
+`WebSocketSource`, `RecordingSource` and the Python provider exchange **PoseFrame v2** JSON in raw MediaPipe conventions:
+
+```json
+{
+  "v": 2, "t": 12345.678, "src": "python-opencv", "size": [1280, 720],
+  "pose": { "world": [[x, y, z, visibility] /* ×33 */], "image": [[x, y, z, visibility] /* ×33 */] },
+  "hands": { "left": { "world": [[x,y,z] /* ×21 */], "image": [[x,y,z] /* ×21 */], "score": 0.9 }, "right": null },
+  "face": { "blendshapes": { "jawOpen": 0.21 }, "matrix": [/* 16 */] }
+}
+```
+
+`pose` is `null` when nobody is detected; `hands` and `face` are optional. Recording files wrap frames as `{"format": "cameracharacter-mocap", "version": 2, "meta": {...}, "frames": [...]}`. The TypeScript definitions are in [`src/core/types.ts`](src/core/types.ts).
+
+## Development
+
+```bash
+npm run dev          # Vite dev server
+npm run typecheck    # TypeScript (strict)
+npm run test         # Vitest unit tests (math, mapping, solver, filters, exports)
+npm run build        # production build to dist/
+npm run gen:recordings   # synthetic .mocap.json takes into public/recordings/
+npm run test:e2e     # Playwright end-to-end (headless Chromium, synthetic takes)
+```
+
+Project layout:
+
+```
+src/core        shared types (PoseFrame v2, humanoid roles, rig profile) and math
+src/tracking    MediaPipe, WebSocket and recording sources; filters and mirror
+src/rig         model loading, bind-pose analysis, automatic bone mapping, profiles
+src/retarget    canonical conventions, body model, world-delta solver, calibration
+src/stage       renderer, lights, mirror camera, environments
+src/record      landmark recorder, clip recorder, GLB/BVH/video export
+src/diagnostics overlays, per-bone error, snapshot bundle
+src/testing     synthetic human generator (tests, e2e, webcam-free demo source)
+src/app         UI panels and orchestration
+backend         optional Python provider
+docs            design document
+tests, e2e      Vitest and Playwright suites
+```
+
+Testing strategy: the math, mapping and solver are pure and tested in Node, including against the real bundled Meshy rig (read by a minimal GLB skeleton reader) and synthetic rigs; the solver is checked by generating landmarks from a synthetic human with known joint angles and asserting that the driven bones reproduce those directions. End-to-end tests load the app in headless Chromium with synthetic recordings and save screenshots.
+
+## Roadmap
+
+Foot IK and ground contact, VRM spring bones, full ARKit blendshape mapping for models that carry them, multi-person tracking, WebGPU rendering, OSC/VMC output for other tools, take management (trimming, multiple takes), scene authoring (camera paths, lights).
+
+## Acknowledgements
+
+Pose tracking by [MediaPipe Tasks Vision](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker). Rendering by [three.js](https://threejs.org/). VRM support by [three-vrm](https://github.com/pixiv/three-vrm).

@@ -12,3 +12,4 @@ e2e/screenshots/
 __pycache__/
 *.pyc
 .venv/
+public/recordings/*.mocap.json
