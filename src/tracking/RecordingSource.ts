@@ -5,7 +5,9 @@
  *
  * Emitted timestamps are rewritten so they are monotonic in playback time and
  * expressed in recording-time milliseconds (independent of playback speed):
- * looping and seeking add an offset so the stream never goes backwards.
+ * looping and seeking add an offset so the stream never goes backwards. `now`
+ * is stamped at emission (performance.now()) so clip/video recorders align
+ * with the replay, not with the original capture.
  * Only `fromFile` / `fromUrl` need a browser; everything else runs in Node.
  */
 import type { MocapRecording, PoseFrame } from '../core/types';
@@ -245,7 +247,7 @@ export class RecordingSource extends BaseSource {
   private emitAt(index: number): void {
     const src = this.recording.frames[index];
     const t = this.rel[index] + this.tOffset;
-    const frame: PoseFrame = { ...src, t, src: RECORDING_SRC };
+    const frame: PoseFrame = { ...src, t, now: nowMs(), src: RECORDING_SRC };
     this.lastTOut = t;
     this.lastEmitted = index;
     this.position = this.rel[index];

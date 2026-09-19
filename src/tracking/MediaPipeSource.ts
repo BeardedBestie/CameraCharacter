@@ -4,6 +4,16 @@
  * reduced cadence, driven by requestVideoFrameCallback (rAF fallback).
  * Emits PoseFrame v2 in raw MediaPipe conventions; see docs/DESIGN.md §11.
  *
+ * Lifecycle rules:
+ * - every async creation carries the generation it was started in; a
+ *   landmarker that finishes after `stop()` (or a later `start()`) moved the
+ *   generation is closed immediately instead of being adopted;
+ * - hand/face model failures never abort the source: the feature is disabled
+ *   and reported in the status message;
+ * - an inference-time failure on the GPU delegate rebuilds every landmarker on
+ *   the CPU once; any further failure tears the source down (camera released)
+ *   before the error is reported.
+ *
  * Browser only. The pure conversion helpers live in ./convert.ts.
  */
 import {
@@ -33,6 +43,7 @@ export const MEDIAPIPE_SRC = 'mediapipe-web';
 
 /** `WasmFileset` is not exported by the package typings; derive it. */
 type WasmFileset = Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
+type Delegate = 'GPU' | 'CPU';
 
 export interface MediaPipeSourceOptions {
   /** An already playing video element (camera or file). When omitted the source opens a camera. */
@@ -52,7 +63,24 @@ export interface MediaPipeLastResult {
   t: number;
 }
 
+/** Why an optional feature is currently off although the settings ask for it. */
+export interface AuxFeatureState {
+  hands?: string;
+  face?: string;
+}
+
 const CONFIDENCE = 0.5;
+
+class StaleGenerationError extends Error {
+  constructor() {
+    super('MediaPipe source was stopped or restarted while loading');
+    this.name = 'StaleGenerationError';
+  }
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export class MediaPipeSource extends BaseSource {
   readonly kind = 'mediapipe' as const;
@@ -68,8 +96,11 @@ export class MediaPipeSource extends BaseSource {
   private hand: HandLandmarker | null = null;
   private face: FaceLandmarker | null = null;
   /** Variant and requested/actual delegate the current pose landmarker was built with. */
-  private poseBuilt: { model: ModelAssetName; requested: 'GPU' | 'CPU'; actual: 'GPU' | 'CPU' } | null = null;
-  private delegateInUse: 'GPU' | 'CPU' = 'GPU';
+  private poseBuilt: { model: ModelAssetName; requested: Delegate; actual: Delegate } | null = null;
+  private delegateInUse: Delegate = 'GPU';
+  /** Set after an inference-time GPU failure forced the CPU; cleared by start(). */
+  private cpuForced = false;
+  private auxDisabled: AuxFeatureState = {};
 
   private running = false;
   private generation = 0;
@@ -103,8 +134,13 @@ export class MediaPipeSource extends BaseSource {
   }
 
   /** Delegate actually in use after fallback. */
-  get delegate(): 'GPU' | 'CPU' {
+  get delegate(): Delegate {
     return this.delegateInUse;
+  }
+
+  /** Optional features that were disabled after a load failure, with the reason. */
+  get disabledFeatures(): AuxFeatureState {
+    return { ...this.auxDisabled };
   }
 
   getSettings(): TrackingSettings {
@@ -116,6 +152,8 @@ export class MediaPipeSource extends BaseSource {
   async start(): Promise<void> {
     if (this.running) return;
     const gen = ++this.generation;
+    this.cpuForced = false;
+    this.auxDisabled = {};
     this.setStatus({ state: 'starting', message: 'Opening camera' });
     try {
       if (!this.videoEl) {
@@ -132,31 +170,30 @@ export class MediaPipeSource extends BaseSource {
         this.ownsCamera = true;
       } else if (this.videoEl.paused) {
         await this.videoEl.play();
+        if (gen !== this.generation) return;
       }
 
       this.setStatus({ state: 'starting', message: 'Loading MediaPipe runtime' });
       if (!this.fileset) {
         const wasmPath = await resolveWasmBasePath();
-        this.fileset = await FilesetResolver.forVisionTasks(wasmPath);
+        const fileset = await FilesetResolver.forVisionTasks(wasmPath);
+        if (gen !== this.generation) return;
+        this.fileset = fileset;
       }
       if (gen !== this.generation) return;
 
-      await this.createPoseLandmarker(this.settings);
-      if (gen !== this.generation) return;
-      await this.syncAuxLandmarkers(this.settings);
+      await this.createPoseLandmarker(this.settings, this.settings.delegate, gen);
+      await this.syncAuxLandmarkers(this.settings, gen);
       if (gen !== this.generation) return;
 
       this.running = true;
       this.lastMediaTime = -1;
       this.frameCounter = 0;
-      this.setStatus({
-        state: 'running',
-        message: `Pose ${this.settings.poseModel} on ${this.delegateInUse}`,
-      });
+      this.setStatus({ state: 'running', message: this.runningMessage() });
       this.scheduleNext();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.setStatus({ state: 'error', message });
+      if (err instanceof StaleGenerationError || gen !== this.generation) return;
+      this.setStatus({ state: 'error', message: errorText(err) });
       this.releaseVideo();
       throw err;
     }
@@ -164,6 +201,12 @@ export class MediaPipeSource extends BaseSource {
 
   stop(): void {
     this.generation++;
+    this.teardown();
+    this.setStatus({ state: 'stopped' });
+  }
+
+  /** Release everything the source holds (landmarkers, loop, camera). */
+  private teardown(): void {
     this.running = false;
     this.cancelLoop();
     this.closeLandmarker('pose');
@@ -173,7 +216,6 @@ export class MediaPipeSource extends BaseSource {
     this.lastHands = null;
     this.lastFace = null;
     this._lastResult = { pose: null, hands: null, face: null, t: 0 };
-    this.setStatus({ state: 'stopped' });
   }
 
   /**
@@ -183,117 +225,179 @@ export class MediaPipeSource extends BaseSource {
   setSettings(settings: TrackingSettings): Promise<void> {
     const next = { ...settings };
     this.settings = next;
+    if (next.hands) delete this.auxDisabled.hands;
+    if (next.face) delete this.auxDisabled.face;
     if (!this.running && !this.pose) return Promise.resolve();
     this.applyingSettings = this.applyingSettings
       .then(async () => {
         if (this.settings !== next) return; // superseded
         const gen = this.generation;
         const wantModel = poseModelAsset(next.poseModel);
+        const wantDelegate: Delegate = this.cpuForced ? 'CPU' : next.delegate;
         const poseChanged =
-          !this.poseBuilt || this.poseBuilt.model !== wantModel || this.poseBuilt.requested !== next.delegate;
+          !this.poseBuilt || this.poseBuilt.model !== wantModel || this.poseBuilt.requested !== wantDelegate;
         if (poseChanged) {
           this.setStatus({ message: `Switching to pose ${next.poseModel}` });
-          await this.createPoseLandmarker(next);
-          if (gen !== this.generation) return;
-          if (this.running) this.setStatus({ state: 'running', message: `Pose ${next.poseModel} on ${this.delegateInUse}` });
+          await this.createPoseLandmarker(next, wantDelegate, gen);
+          if (this.running) this.setStatus({ state: 'running', message: this.runningMessage() });
         }
-        await this.syncAuxLandmarkers(next);
+        await this.syncAuxLandmarkers(next, gen);
+        if (this.running && gen === this.generation) this.setStatus({ state: 'running', message: this.runningMessage() });
       })
       .catch((err: unknown) => {
-        this.setStatus({ state: 'error', message: err instanceof Error ? err.message : String(err) });
+        if (err instanceof StaleGenerationError) return;
+        this.setStatus({ state: 'error', message: errorText(err) });
       });
     return this.applyingSettings;
   }
 
+  private runningMessage(): string {
+    const parts = [`Pose ${this.settings.poseModel} on ${this.delegateInUse}`];
+    if (this.auxDisabled.hands) parts.push(`hands off (${this.auxDisabled.hands})`);
+    if (this.auxDisabled.face) parts.push(`face off (${this.auxDisabled.face})`);
+    return parts.join('; ');
+  }
+
   // ---- landmarker management -------------------------------------------------
 
-  private async createPoseLandmarker(settings: TrackingSettings): Promise<void> {
+  /** Throws when `gen` is no longer the current generation. */
+  private assertGen(gen: number): void {
+    if (gen !== this.generation) throw new StaleGenerationError();
+  }
+
+  /**
+   * Await a landmarker creation on behalf of generation `gen`; if the
+   * generation moved meanwhile the result is closed and a stale error thrown.
+   */
+  private async adopt<T extends { close(): void }>(creation: Promise<T>, gen: number): Promise<T> {
+    const lm = await creation;
+    if (gen !== this.generation) {
+      try {
+        lm.close();
+      } catch {
+        // ignore
+      }
+      throw new StaleGenerationError();
+    }
+    return lm;
+  }
+
+  private async createPoseLandmarker(settings: TrackingSettings, requested: Delegate, gen: number): Promise<void> {
     if (!this.fileset) throw new Error('MediaPipe runtime not loaded');
+    const fileset = this.fileset;
     const model = poseModelAsset(settings.poseModel);
     this.setStatus({ message: `Loading pose model (${settings.poseModel})` });
     const bytes = await loadModelAsset(model);
-    const create = (delegate: 'GPU' | 'CPU') =>
-      PoseLandmarker.createFromOptions(this.fileset as WasmFileset, {
-        baseOptions: { modelAssetBuffer: bytes, delegate },
-        runningMode: 'VIDEO',
-        numPoses: 1,
-        minPoseDetectionConfidence: CONFIDENCE,
-        minPosePresenceConfidence: CONFIDENCE,
-        minTrackingConfidence: CONFIDENCE,
-      });
+    this.assertGen(gen);
+    const create = (delegate: Delegate) =>
+      this.adopt(
+        PoseLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetBuffer: bytes, delegate },
+          runningMode: 'VIDEO',
+          numPoses: 1,
+          minPoseDetectionConfidence: CONFIDENCE,
+          minPosePresenceConfidence: CONFIDENCE,
+          minTrackingConfidence: CONFIDENCE,
+        }),
+        gen,
+      );
     let landmarker: PoseLandmarker;
-    let delegate = settings.delegate;
+    let delegate = requested;
     try {
       landmarker = await create(delegate);
     } catch (err) {
-      if (delegate !== 'GPU') throw err;
-      const reason = err instanceof Error ? err.message : String(err);
-      this.setStatus({ message: `GPU delegate unavailable (${reason}); using CPU` });
+      if (err instanceof StaleGenerationError || delegate !== 'GPU') throw err;
+      this.setStatus({ message: `GPU delegate unavailable (${errorText(err)}); using CPU` });
       delegate = 'CPU';
       landmarker = await create('CPU');
     }
     const old = this.pose;
     this.pose = landmarker;
-    this.poseBuilt = { model, requested: settings.delegate, actual: delegate };
+    this.poseBuilt = { model, requested, actual: delegate };
     this.delegateInUse = delegate;
     // A fresh graph needs strictly increasing timestamps from its own start; ours are global and increasing.
     if (old) old.close();
   }
 
-  private async syncAuxLandmarkers(settings: TrackingSettings): Promise<void> {
+  private async syncAuxLandmarkers(settings: TrackingSettings, gen: number): Promise<void> {
     if (!this.fileset) return;
-    if (settings.hands && !this.hand) {
+    const fileset = this.fileset;
+    this.assertGen(gen);
+
+    if (settings.hands && !this.hand && !this.auxDisabled.hands) {
       this.setStatus({ message: 'Loading hand model' });
-      const bytes = await loadModelAsset('hand');
-      const create = (delegate: 'GPU' | 'CPU') =>
-        HandLandmarker.createFromOptions(this.fileset as WasmFileset, {
-          baseOptions: { modelAssetBuffer: bytes, delegate },
-          runningMode: 'VIDEO',
-          numHands: 2,
-          minHandDetectionConfidence: CONFIDENCE,
-          minHandPresenceConfidence: CONFIDENCE,
-          minTrackingConfidence: CONFIDENCE,
-        });
-      const hand = await this.createWithFallback(create);
-      if (this.settings.hands) this.hand = hand;
-      else hand.close();
+      try {
+        const bytes = await loadModelAsset('hand');
+        this.assertGen(gen);
+        const hand = await this.createWithFallback(
+          (delegate) =>
+            this.adopt(
+              HandLandmarker.createFromOptions(fileset, {
+                baseOptions: { modelAssetBuffer: bytes, delegate },
+                runningMode: 'VIDEO',
+                numHands: 2,
+                minHandDetectionConfidence: CONFIDENCE,
+                minHandPresenceConfidence: CONFIDENCE,
+                minTrackingConfidence: CONFIDENCE,
+              }),
+              gen,
+            ),
+        );
+        if (this.settings.hands) this.hand = hand;
+        else hand.close();
+      } catch (err) {
+        if (err instanceof StaleGenerationError) throw err;
+        this.auxDisabled.hands = errorText(err);
+        this.setStatus({ message: `Hand tracking unavailable: ${this.auxDisabled.hands}` });
+      }
     } else if (!settings.hands && this.hand) {
       this.closeLandmarker('hand');
       this.lastHands = null;
       this._lastResult = { ...this._lastResult, hands: null };
     }
 
-    if (settings.face && !this.face) {
+    this.assertGen(gen);
+    if (settings.face && !this.face && !this.auxDisabled.face) {
       this.setStatus({ message: 'Loading face model' });
-      const bytes = await loadModelAsset('face');
-      const create = (delegate: 'GPU' | 'CPU') =>
-        FaceLandmarker.createFromOptions(this.fileset as WasmFileset, {
-          baseOptions: { modelAssetBuffer: bytes, delegate },
-          runningMode: 'VIDEO',
-          numFaces: 1,
-          outputFaceBlendshapes: true,
-          outputFacialTransformationMatrixes: true,
-          minFaceDetectionConfidence: CONFIDENCE,
-          minFacePresenceConfidence: CONFIDENCE,
-          minTrackingConfidence: CONFIDENCE,
-        });
-      const face = await this.createWithFallback(create);
-      if (this.settings.face) this.face = face;
-      else face.close();
+      try {
+        const bytes = await loadModelAsset('face');
+        this.assertGen(gen);
+        const face = await this.createWithFallback(
+          (delegate) =>
+            this.adopt(
+              FaceLandmarker.createFromOptions(fileset, {
+                baseOptions: { modelAssetBuffer: bytes, delegate },
+                runningMode: 'VIDEO',
+                numFaces: 1,
+                outputFaceBlendshapes: true,
+                outputFacialTransformationMatrixes: true,
+                minFaceDetectionConfidence: CONFIDENCE,
+                minFacePresenceConfidence: CONFIDENCE,
+                minTrackingConfidence: CONFIDENCE,
+              }),
+              gen,
+            ),
+        );
+        if (this.settings.face) this.face = face;
+        else face.close();
+      } catch (err) {
+        if (err instanceof StaleGenerationError) throw err;
+        this.auxDisabled.face = errorText(err);
+        this.setStatus({ message: `Face tracking unavailable: ${this.auxDisabled.face}` });
+      }
     } else if (!settings.face && this.face) {
       this.closeLandmarker('face');
       this.lastFace = null;
       this._lastResult = { ...this._lastResult, face: null };
     }
-    if (this.running) this.setStatus({ state: 'running', message: `Pose ${this.settings.poseModel} on ${this.delegateInUse}` });
   }
 
-  private async createWithFallback<T>(create: (delegate: 'GPU' | 'CPU') => Promise<T>): Promise<T> {
+  private async createWithFallback<T>(create: (delegate: Delegate) => Promise<T>): Promise<T> {
     const preferred = this.delegateInUse;
     try {
       return await create(preferred);
     } catch (err) {
-      if (preferred === 'CPU') throw err;
+      if (err instanceof StaleGenerationError || preferred === 'CPU') throw err;
       return await create('CPU');
     }
   }
@@ -364,18 +468,53 @@ export class MediaPipeSource extends BaseSource {
       try {
         this.infer(v);
       } catch (err) {
-        this.setStatus({ state: 'error', message: `Inference failed: ${err instanceof Error ? err.message : String(err)}` });
-        this.running = false;
+        void this.recoverFromInferenceError(err);
         return;
       }
     }
     this.scheduleNext();
   }
 
+  /**
+   * Inference threw. On the GPU delegate rebuild every landmarker on the CPU
+   * once and resume; otherwise (or if the rebuild fails) tear the source down
+   * so the camera is released, then report the error.
+   */
+  private async recoverFromInferenceError(err: unknown): Promise<void> {
+    const gen = this.generation;
+    const reason = errorText(err);
+    if (this.delegateInUse === 'GPU' && !this.cpuForced) {
+      this.cpuForced = true;
+      this.cancelLoop();
+      this.setStatus({ state: 'starting', message: `GPU inference failed (${reason}); rebuilding on CPU` });
+      try {
+        this.closeLandmarker('hand');
+        this.closeLandmarker('face');
+        this.lastHands = null;
+        this.lastFace = null;
+        this._lastResult = { pose: null, hands: null, face: null, t: 0 };
+        await this.createPoseLandmarker(this.settings, 'CPU', gen);
+        await this.syncAuxLandmarkers(this.settings, gen);
+        if (gen !== this.generation) return;
+        this.lastMediaTime = -1;
+        this.setStatus({ state: 'running', message: this.runningMessage() });
+        this.scheduleNext();
+        return;
+      } catch (rebuildErr) {
+        if (rebuildErr instanceof StaleGenerationError || gen !== this.generation) return;
+        this.teardown();
+        this.setStatus({ state: 'error', message: `Inference failed on GPU (${reason}) and CPU (${errorText(rebuildErr)})` });
+        return;
+      }
+    }
+    this.teardown();
+    this.setStatus({ state: 'error', message: `Inference failed: ${reason}` });
+  }
+
   private infer(v: HTMLVideoElement): void {
     const pose = this.pose as PoseLandmarker;
     const ts = this.nextTimestamp();
-    const t0 = performance.now();
+    const captured = performance.now();
     const result = pose.detectForVideo(v, ts);
     const poseLandmarks = result.landmarks.length > 0 ? result.landmarks[0] : null;
     const poseWorld = result.worldLandmarks.length > 0 ? result.worldLandmarks[0] : null;
@@ -398,12 +537,13 @@ export class MediaPipeSource extends BaseSource {
       this.lastFace = this.convertFace(faceResult);
     }
 
-    const inferenceMs = performance.now() - t0;
+    this.reportInferenceMs(performance.now() - captured);
     this._lastResult = { pose: result, hands: handsResult, face: faceResult, t: ts };
 
     const frame: PoseFrame = {
       v: 2,
       t: ts,
+      now: captured,
       src: MEDIAPIPE_SRC,
       size: [v.videoWidth, v.videoHeight],
       pose: poseLandmarks && poseWorld && poseImageTuples
@@ -413,14 +553,7 @@ export class MediaPipeSource extends BaseSource {
     if (this.hand) frame.hands = this.lastHands;
     if (this.face) frame.face = this.lastFace;
 
-    this.emitFrame(frame);
-    if (this.status.state === 'running') {
-      const prev = this.status.inferenceMs ?? inferenceMs;
-      const smoothed = prev + (inferenceMs - prev) * 0.2;
-      if (Math.abs(smoothed - prev) > 0.5 || this.status.inferenceMs === undefined) {
-        this.setStatus({ inferenceMs: Math.round(smoothed * 10) / 10 });
-      }
-    }
+    this.emitFrame(frame, captured);
   }
 
   private convertHands(
@@ -440,7 +573,9 @@ export class MediaPipeSource extends BaseSource {
     if (detected.length === 0) return { left: null, right: null };
     const sides = assignHandSides(detected, poseImage);
     const build = (idx: number | null): HandFrame | null =>
-      idx === null ? null : makeHandFrame(res.worldLandmarks[idx], res.landmarks[idx], detected[idx].score);
+      idx === null
+        ? null
+        : makeHandFrame(res.worldLandmarks[idx], res.landmarks[idx], detected[idx].score, detected[idx].handedness);
     return { left: build(sides.left), right: build(sides.right) };
   }
 

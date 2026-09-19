@@ -4,8 +4,23 @@
  * here before the rest of the pipeline sees it. Validated frames are fresh
  * objects (no aliasing of the input) with visibility filled in.
  */
-import type { FaceFrame, HandFrame, LandmarkTuple, MocapRecording, PointTuple, PoseFrame } from '../core/types';
+import type {
+  CameraMeta,
+  FaceFrame,
+  HandFrame,
+  LandmarkTuple,
+  MocapMeta,
+  MocapRecording,
+  PointTuple,
+  PoseCalibration,
+  PoseFrame,
+  SmoothingSettings,
+  TrackerMeta,
+} from '../core/types';
+import { DEFAULT_SETTINGS } from '../core/types';
+import { normalizeHandednessLabel } from './convert';
 import { HAND_LANDMARK_COUNT, POSE_LANDMARK_COUNT } from './landmarks';
+import { MEDIAPIPE_VERSION } from './mediapipeModels';
 
 function isFiniteNumber(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v);
@@ -66,11 +81,15 @@ function toPointArray(v: unknown, count: number): PointTuple[] | null {
 function toHandFrame(v: unknown): HandFrame | null | undefined {
   if (v === null || v === undefined) return null;
   if (!isRecord(v)) return undefined;
-  const world = toPointArray(v.world, HAND_LANDMARK_COUNT);
+  // `local` per the v2 protocol; `world` is accepted as the pre-2.1 name of the same array.
+  const local = toPointArray(v.local !== undefined ? v.local : v.world, HAND_LANDMARK_COUNT);
   const image = toPointArray(v.image, HAND_LANDMARK_COUNT);
-  if (!world || !image) return undefined;
+  if (!local || !image) return undefined;
   const score = isFiniteNumber(v.score) ? Math.min(1, Math.max(0, v.score)) : 1;
-  return { world, image, score };
+  const hand: HandFrame = { local, image, score };
+  const handedness = normalizeHandednessLabel(v.handedness);
+  if (handedness) hand.handedness = handedness;
+  return hand;
 }
 
 function toFaceFrame(v: unknown): FaceFrame | null | undefined {
@@ -123,6 +142,8 @@ export function validatePoseFrame(value: unknown): PoseFrame | null {
   }
 
   const frame: PoseFrame = { v: 2, t: value.t, src, size, pose };
+  // Optional capture clock; anything that is not a finite number is dropped, not rejected.
+  if (isFiniteNumber(value.now)) frame.now = value.now;
 
   if (value.hands !== undefined) {
     if (value.hands === null) {
@@ -181,7 +202,84 @@ export function parseMocapRecording(json: unknown): MocapRecording {
     frames[i] = f;
   }
 
-  const metaRaw = isRecord(json.meta) ? json.meta : {};
+  const meta = parseMocapMeta(isRecord(json.meta) ? json.meta : {}, frames);
+  return { format: MOCAP_FORMAT, version: MOCAP_VERSION, meta, frames };
+}
+
+const DELEGATES = new Set(['GPU', 'CPU']);
+const POSE_MODELS = new Set(['lite', 'full', 'heavy']);
+
+function parseCameraMeta(v: unknown): CameraMeta | undefined {
+  if (!isRecord(v)) return undefined;
+  const out: CameraMeta = {};
+  if (typeof v.deviceLabel === 'string') out.deviceLabel = v.deviceLabel;
+  if (typeof v.facingMode === 'string') out.facingMode = v.facingMode;
+  if (isFiniteNumber(v.frameRate)) out.frameRate = v.frameRate;
+  if (isFiniteNumber(v.vfovDeg)) out.vfovDeg = v.vfovDeg;
+  return out;
+}
+
+function parseTrackerMeta(v: unknown): TrackerMeta | undefined {
+  if (!isRecord(v)) return undefined;
+  const out: TrackerMeta = {
+    lib: typeof v.lib === 'string' ? v.lib : 'unknown',
+    version: typeof v.version === 'string' ? v.version : 'unknown',
+  };
+  if (typeof v.poseModel === 'string' && POSE_MODELS.has(v.poseModel)) out.poseModel = v.poseModel as TrackerMeta['poseModel'];
+  if (typeof v.delegate === 'string' && DELEGATES.has(v.delegate)) out.delegate = v.delegate as TrackerMeta['delegate'];
+  if (typeof v.hands === 'boolean') out.hands = v.hands;
+  if (typeof v.face === 'boolean') out.face = v.face;
+  if (isFiniteNumber(v.minPoseDetectionConfidence)) out.minPoseDetectionConfidence = v.minPoseDetectionConfidence;
+  if (isFiniteNumber(v.minTrackingConfidence)) out.minTrackingConfidence = v.minTrackingConfidence;
+  return out;
+}
+
+/** Lenient: every known numeric field is taken when finite, the defaults fill the rest. */
+function parseSmoothingMeta(v: unknown): SmoothingSettings | undefined {
+  if (!isRecord(v)) return undefined;
+  const d = DEFAULT_SETTINGS.smoothing;
+  const num = (key: keyof SmoothingSettings, fallback: number): number => {
+    const raw = v[key];
+    return isFiniteNumber(raw) ? raw : fallback;
+  };
+  const gate = (key: 'gateBody' | 'gateFeet' | 'gateFace') => {
+    const raw = v[key];
+    const on = isRecord(raw) && isFiniteNumber(raw.on) ? raw.on : d[key].on;
+    const off = isRecord(raw) && isFiniteNumber(raw.off) ? raw.off : d[key].off;
+    return { on, off };
+  };
+  const holdRaw = isRecord(v.poseHoldMs) ? v.poseHoldMs : {};
+  return {
+    oneEuroMinCutoff: num('oneEuroMinCutoff', d.oneEuroMinCutoff),
+    oneEuroBeta: num('oneEuroBeta', d.oneEuroBeta),
+    oneEuroDCutoff: num('oneEuroDCutoff', d.oneEuroDCutoff),
+    boneRate: num('boneRate', d.boneRate),
+    boneRateVelocityGain: num('boneRateVelocityGain', d.boneRateVelocityGain),
+    gateBody: gate('gateBody'),
+    gateFeet: gate('gateFeet'),
+    gateFace: gate('gateFace'),
+    gateDwellMs: num('gateDwellMs', d.gateDwellMs),
+    gateReleaseMs: num('gateReleaseMs', d.gateReleaseMs),
+    outOfFrameReleaseMs: num('outOfFrameReleaseMs', d.outOfFrameReleaseMs),
+    poseHoldMs: {
+      arms: isFiniteNumber(holdRaw.arms) ? holdRaw.arms : d.poseHoldMs.arms,
+      legs: isFiniteNumber(holdRaw.legs) ? holdRaw.legs : d.poseHoldMs.legs,
+      torso: isFiniteNumber(holdRaw.torso) ? holdRaw.torso : d.poseHoldMs.torso,
+    },
+    relaxRate: num('relaxRate', d.relaxRate),
+    twistTau: num('twistTau', d.twistTau),
+    lowerArmTwistFraction: num('lowerArmTwistFraction', d.lowerArmTwistFraction),
+    reacquireRampMs: num('reacquireRampMs', d.reacquireRampMs),
+    standingBaselineSec: num('standingBaselineSec', d.standingBaselineSec),
+  };
+}
+
+/**
+ * Parse the `meta` block of a recording leniently: unknown or malformed
+ * optional fields are dropped, never fatal. `size` defaults to the first
+ * frame's size and `source` to the first frame's `src`.
+ */
+export function parseMocapMeta(metaRaw: Record<string, unknown>, frames: readonly PoseFrame[]): MocapMeta {
   let size: [number, number] = [0, 0];
   const sizeRaw = metaRaw.size;
   if (Array.isArray(sizeRaw) && sizeRaw.length === 2 && isFiniteNumber(sizeRaw[0]) && isFiniteNumber(sizeRaw[1])) {
@@ -189,8 +287,7 @@ export function parseMocapRecording(json: unknown): MocapRecording {
   } else if (frames.length > 0) {
     size = [frames[0].size[0], frames[0].size[1]];
   }
-
-  const meta: MocapRecording['meta'] = {
+  const meta: MocapMeta = {
     createdAt: typeof metaRaw.createdAt === 'string' ? metaRaw.createdAt : '',
     source: typeof metaRaw.source === 'string' ? metaRaw.source : frames[0]?.src ?? 'unknown',
     size,
@@ -198,11 +295,55 @@ export function parseMocapRecording(json: unknown): MocapRecording {
   };
   if (typeof metaRaw.notes === 'string') meta.notes = metaRaw.notes;
   if (isFiniteNumber(metaRaw.fovDeg)) meta.fovDeg = metaRaw.fovDeg;
-  if (isRecord(metaRaw.calibration) && metaRaw.calibration.version === 2) {
-    meta.calibration = metaRaw.calibration as unknown as MocapRecording['meta']['calibration'];
-  } else if (metaRaw.calibration === null) {
+  const t0 = metaRaw.t0;
+  if (isRecord(t0) && typeof t0.wallclock === 'string' && isFiniteNumber(t0.performanceNow)) {
+    meta.t0 = { wallclock: t0.wallclock, performanceNow: t0.performanceNow };
+  }
+  const camera = parseCameraMeta(metaRaw.camera);
+  if (camera) meta.camera = camera;
+  const tracker = parseTrackerMeta(metaRaw.tracker);
+  if (tracker) meta.tracker = tracker;
+  const smoothing = parseSmoothingMeta(metaRaw.smoothing);
+  if (smoothing) meta.smoothing = smoothing;
+  const cal = metaRaw.calibration;
+  if (isRecord(cal) && cal.version === 3 && isRecord(cal.bases)) {
+    meta.calibration = cal as unknown as PoseCalibration;
+  } else if (cal === null) {
     meta.calibration = null;
   }
+  const ref = metaRaw.referenceModel;
+  if (isRecord(ref) && typeof ref.familyKey === 'string' && typeof ref.displayName === 'string') {
+    meta.referenceModel = { familyKey: ref.familyKey, displayName: ref.displayName };
+    if (typeof ref.instanceKey === 'string') meta.referenceModel.instanceKey = ref.instanceKey;
+  } else if (ref === null) {
+    meta.referenceModel = null;
+  }
+  return meta;
+}
 
-  return { format: MOCAP_FORMAT, version: MOCAP_VERSION, meta, frames };
+/** Library identity written into `meta.tracker` by the browser recorder. */
+export const TRACKER_LIB = '@mediapipe/tasks-vision';
+export const TRACKER_VERSION = MEDIAPIPE_VERSION;
+
+/**
+ * Fill a MocapMeta for the recorder: `createdAt` defaults to now, the tracker
+ * block to this build's MediaPipe library/version, everything else to the
+ * protocol defaults. Fields in `partial` win; `undefined` entries are dropped.
+ */
+export function buildMocapMeta(partial: Partial<MocapMeta> = {}, now: Date = new Date()): MocapMeta {
+  const meta: MocapMeta = {
+    createdAt: partial.createdAt ?? now.toISOString(),
+    source: partial.source ?? 'unknown',
+    size: partial.size ? [partial.size[0], partial.size[1]] : [0, 0],
+    mirror: partial.mirror ?? false,
+    tracker: { lib: TRACKER_LIB, version: TRACKER_VERSION, ...(partial.tracker ?? {}) },
+  };
+  if (partial.fovDeg !== undefined) meta.fovDeg = partial.fovDeg;
+  if (partial.t0 !== undefined) meta.t0 = { ...partial.t0 };
+  if (partial.camera !== undefined) meta.camera = { ...partial.camera };
+  if (partial.smoothing !== undefined) meta.smoothing = { ...partial.smoothing };
+  if (partial.calibration !== undefined) meta.calibration = partial.calibration;
+  if (partial.referenceModel !== undefined) meta.referenceModel = partial.referenceModel;
+  if (partial.notes !== undefined) meta.notes = partial.notes;
+  return meta;
 }

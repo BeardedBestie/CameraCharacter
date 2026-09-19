@@ -1,11 +1,12 @@
 /**
  * PoseSource contract shared by every tracking provider (MediaPipe in the
- * browser, a WebSocket provider, recorded takes) plus a small base class that
- * handles listener bookkeeping, status and fps measurement. Pure: no DOM.
+ * browser, a WebSocket provider, recorded takes, the synthetic human) plus a
+ * small base class that handles listener bookkeeping, status and fps
+ * measurement. Pure: no DOM.
  */
 import type { PoseFrame } from '../core/types';
 
-export type SourceKind = 'mediapipe' | 'websocket' | 'recording';
+export type SourceKind = 'mediapipe' | 'websocket' | 'recording' | 'synthetic';
 
 export type SourceState = 'idle' | 'starting' | 'running' | 'error' | 'stopped';
 
@@ -15,7 +16,7 @@ export interface SourceStatus {
   message?: string;
   /** Measured frames per second delivered to listeners. */
   fps?: number;
-  /** Most recent inference time in ms (MediaPipe only). */
+  /** Smoothed inference time in ms (MediaPipe only), published at the same cadence as fps. */
   inferenceMs?: number;
 }
 
@@ -79,6 +80,8 @@ export abstract class BaseSource implements PoseSource {
   private _status: SourceStatus = { state: 'idle' };
   private readonly fpsMeter = new FpsMeter();
   private lastFpsPublish = -Infinity;
+  /** Smoothed inference time, merged into the throttled fps publish when set. */
+  private inferenceMsSmoothed = NaN;
 
   /** How often (ms) the fps figure is pushed into the status while running. */
   protected fpsPublishIntervalMs = 500;
@@ -127,8 +130,19 @@ export abstract class BaseSource implements PoseSource {
     }
     if (this._status.state === 'running' && wallMs - this.lastFpsPublish >= this.fpsPublishIntervalMs) {
       this.lastFpsPublish = wallMs;
-      this.setStatus({ fps: Math.round(fps * 10) / 10 });
+      const patch: Partial<SourceStatus> = { fps: Math.round(fps * 10) / 10 };
+      if (!Number.isNaN(this.inferenceMsSmoothed)) patch.inferenceMs = Math.round(this.inferenceMsSmoothed * 10) / 10;
+      this.setStatus(patch);
     }
+  }
+
+  /**
+   * Record one inference duration (ms). The value is low-passed and published
+   * together with the fps figure at the throttled cadence, never per frame.
+   */
+  protected reportInferenceMs(ms: number): void {
+    if (!Number.isFinite(ms)) return;
+    this.inferenceMsSmoothed = Number.isNaN(this.inferenceMsSmoothed) ? ms : this.inferenceMsSmoothed + (ms - this.inferenceMsSmoothed) * 0.2;
   }
 
   /**
@@ -142,7 +156,10 @@ export abstract class BaseSource implements PoseSource {
       if (patch.fps === undefined) delete next.fps;
       if (patch.inferenceMs === undefined) delete next.inferenceMs;
       if (patch.message === undefined) delete next.message;
-      if (patch.state !== 'running') this.fpsMeter.reset();
+      if (patch.state !== 'running') {
+        this.fpsMeter.reset();
+        this.inferenceMsSmoothed = NaN;
+      }
       this.lastFpsPublish = -Infinity;
     }
     this._status = next;

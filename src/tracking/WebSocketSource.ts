@@ -3,10 +3,21 @@
  * from the optional Python provider (backend/stream_pose.py). Reconnects with
  * exponential backoff until stopped. Only `start()` touches the WebSocket
  * API, so the module (and `parsePoseFrame`) loads in Node.
+ *
+ * Timestamps: the provider's `t` is re-based by an offset so the emitted
+ * stream stays monotonic across reconnects and provider restarts while the
+ * provider's own inter-frame spacing is preserved. `now` is stamped locally at
+ * receipt (the provider's clock is not comparable with performance.now()).
  */
 import type { PoseFrame } from '../core/types';
 import { BaseSource } from './PoseSource';
 import { parsePoseFrameText } from './protocol';
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
 
 /** Parse one JSON text message into a validated PoseFrame v2, or null. */
 export function parsePoseFrame(text: string): PoseFrame | null {
@@ -15,6 +26,10 @@ export function parsePoseFrame(text: string): PoseFrame | null {
 
 export const WS_RECONNECT_MIN_MS = 500;
 export const WS_RECONNECT_MAX_MS = 10_000;
+/** Inter-frame spacing assumed until the provider's own spacing has been observed (ms). */
+export const WS_DEFAULT_GAP_MS = 1000 / 30;
+/** Raw gaps above this (ms) are treated as a stall, not as the provider's spacing. */
+const MAX_PLAUSIBLE_GAP_MS = 1000;
 
 export class WebSocketSource extends BaseSource {
   readonly kind = 'websocket' as const;
@@ -23,8 +38,18 @@ export class WebSocketSource extends BaseSource {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private backoffMs = WS_RECONNECT_MIN_MS;
   private active = false;
-  private lastT = -Infinity;
   private invalidCount = 0;
+
+  /** Added to the provider's `t` to keep the emitted stream monotonic. */
+  private tOffset = 0;
+  /** Last emitted `t`, NaN before the first frame. */
+  private lastOut = NaN;
+  /** Last raw provider `t`, NaN before the first frame of a session. */
+  private lastRaw = NaN;
+  /** Provider inter-frame spacing as last observed (ms). */
+  private gapMs = WS_DEFAULT_GAP_MS;
+  /** Set on (re)connect: the next frame continues one gap after the last emitted one. */
+  private rebasePending = false;
 
   constructor(public readonly url: string) {
     super();
@@ -43,8 +68,12 @@ export class WebSocketSource extends BaseSource {
     }
     this.active = true;
     this.backoffMs = WS_RECONNECT_MIN_MS;
-    this.lastT = -Infinity;
     this.invalidCount = 0;
+    this.tOffset = 0;
+    this.lastOut = NaN;
+    this.lastRaw = NaN;
+    this.gapMs = WS_DEFAULT_GAP_MS;
+    this.rebasePending = false;
     this.connect();
   }
 
@@ -89,6 +118,8 @@ export class WebSocketSource extends BaseSource {
     socket.onopen = () => {
       if (this.socket !== socket) return;
       this.backoffMs = WS_RECONNECT_MIN_MS;
+      this.rebasePending = true;
+      this.lastRaw = NaN;
       this.setStatus({ state: 'running', message: `Connected to ${this.url}` });
     };
     socket.onmessage = (ev: MessageEvent) => {
@@ -122,16 +153,40 @@ export class WebSocketSource extends BaseSource {
     };
   }
 
-  private handleText(text: string): void {
+  /** Parse one text message and emit it with a re-based, monotonic timestamp. Exposed for tests. */
+  handleText(text: string): void {
     const frame = parsePoseFrame(text);
     if (!frame) {
       this.invalidCount++;
       return;
     }
-    // Enforce a monotonic timestamp per source (the filter relies on it).
-    if (frame.t <= this.lastT) frame.t = this.lastT + 1;
-    this.lastT = frame.t;
+    frame.t = this.rebase(frame.t);
+    frame.now = nowMs();
     this.emitFrame(frame);
+  }
+
+  /**
+   * Offset re-base: within a session the provider's spacing is kept verbatim;
+   * on reconnect, or whenever the provider's clock jumps backwards, the offset
+   * is recomputed once so the stream continues one observed gap after the last
+   * emitted frame.
+   */
+  private rebase(rawT: number): number {
+    if (!Number.isNaN(this.lastRaw)) {
+      const g = rawT - this.lastRaw;
+      if (g > 0 && g <= MAX_PLAUSIBLE_GAP_MS) this.gapMs = g;
+    }
+    this.lastRaw = rawT;
+    if (Number.isNaN(this.lastOut)) {
+      this.rebasePending = false;
+      this.tOffset = 0;
+    } else if (this.rebasePending || rawT + this.tOffset <= this.lastOut) {
+      this.rebasePending = false;
+      this.tOffset = this.lastOut + this.gapMs - rawT;
+    }
+    const out = rawT + this.tOffset;
+    this.lastOut = out;
+    return out;
   }
 
   private scheduleReconnect(): void {

@@ -49,6 +49,16 @@ export async function listCameras(): Promise<MediaDeviceInfo[]> {
   return cams;
 }
 
+/** Errors that mean "this particular device" rather than "no permission" or "bad request". */
+export const RETRYABLE_CAMERA_ERRORS: ReadonlySet<string> = new Set(['OverconstrainedError', 'NotFoundError', 'NotReadableError']);
+
+/** True when a getUserMedia failure warrants a retry with the facingMode fallback. */
+export function isDeviceUnavailableError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const name = (err as { name?: unknown }).name;
+  return typeof name === 'string' && RETRYABLE_CAMERA_ERRORS.has(name);
+}
+
 function buildConstraints(opts: OpenCameraOptions): MediaStreamConstraints {
   const video: MediaTrackConstraints = {};
   if (opts.deviceId) video.deviceId = { exact: opts.deviceId };
@@ -69,8 +79,8 @@ export async function openCamera(opts: OpenCameraOptions = {}): Promise<OpenedCa
   try {
     stream = await md.getUserMedia(buildConstraints(opts));
   } catch (err) {
-    if (opts.deviceId) {
-      // The stored device may be unplugged: retry with any camera.
+    if (opts.deviceId && isDeviceUnavailableError(err)) {
+      // The stored device is unplugged, busy or cannot satisfy the constraints: retry with any user-facing camera.
       stream = await md.getUserMedia(buildConstraints({ ...opts, deviceId: undefined }));
     } else {
       throw err;

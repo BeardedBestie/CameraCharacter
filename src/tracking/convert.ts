@@ -6,8 +6,8 @@
  * fields of `Landmark`, `NormalizedLandmark`, `Category` and `Matrix` from
  * `@mediapipe/tasks-vision/vision.d.ts`.
  */
-import type { FaceFrame, HandFrame, LandmarkTuple, PointTuple } from '../core/types';
-import { HL, LM } from './landmarks';
+import type { FaceFrame, HandFrame, LandmarkTuple, PointTuple, PoseFrame } from '../core/types';
+import { HL, LM, POSE_MIRROR_INDEX } from './landmarks';
 
 /** Structural subset of MediaPipe `Landmark` / `NormalizedLandmark`. */
 export interface LandmarkLike {
@@ -182,17 +182,54 @@ export function assignHandSides(
   return result;
 }
 
-/** Build a HandFrame from raw landmark lists. */
+/** Raw MediaPipe handedness label normalized to 'Left' | 'Right', or undefined when unrecognised. */
+export function normalizeHandednessLabel(label: unknown): 'Left' | 'Right' | undefined {
+  if (typeof label !== 'string') return undefined;
+  const l = label.trim().toLowerCase();
+  if (l === 'left') return 'Left';
+  if (l === 'right') return 'Right';
+  return undefined;
+}
+
+/**
+ * Build a HandFrame from raw landmark lists. `world` are MediaPipe hand world
+ * landmarks (meters, origin near the hand's geometric centre); they are
+ * re-centred on the exact mean of the 21 points so `local` follows the
+ * protocol (docs/DESIGN.md §10) regardless of the model's own origin choice.
+ */
 export function makeHandFrame(
   world: readonly LandmarkLike[],
   image: readonly LandmarkLike[],
   score: number,
+  handedness?: string,
 ): HandFrame {
-  return {
-    world: pointsToTuples(world),
+  const local = pointsToTuples(world);
+  if (local.length > 0) {
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    for (const p of local) {
+      cx += p[0];
+      cy += p[1];
+      cz += p[2];
+    }
+    cx /= local.length;
+    cy /= local.length;
+    cz /= local.length;
+    for (const p of local) {
+      p[0] -= cx;
+      p[1] -= cy;
+      p[2] -= cz;
+    }
+  }
+  const frame: HandFrame = {
+    local,
     image: pointsToTuples(image),
     score: Number.isFinite(score) ? Math.min(1, Math.max(0, score)) : 1,
   };
+  const h = normalizeHandednessLabel(handedness);
+  if (h) frame.handedness = h;
+  return frame;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,4 +272,52 @@ export function mirrorFaceFrame(face: FaceFrame): FaceFrame {
     blendshapes,
     matrix: face.matrix && face.matrix.length === 16 ? mirrorMatrixYZ(face.matrix) : null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Whole-frame mirroring (docs/DESIGN.md §3). Pure and an involution:
+// mirrorPoseFrame(mirrorPoseFrame(f)) deep-equals f.
+// ---------------------------------------------------------------------------
+
+/** Mirror a hand: negate local x, image x → 1 − x, flip the handedness label. */
+export function mirrorHandFrame(hand: HandFrame): HandFrame {
+  const out: HandFrame = {
+    local: hand.local.map((p): PointTuple => [-p[0] || 0, p[1], p[2]]),
+    image: hand.image.map((p): PointTuple => [1 - p[0], p[1], p[2]]),
+    score: hand.score,
+  };
+  if (hand.handedness) out.handedness = hand.handedness === 'Left' ? 'Right' : 'Left';
+  return out;
+}
+
+/**
+ * Mirror a raw PoseFrame: world x → −x and image x → 1 − x with left/right
+ * landmark indices swapped; hands swapped then mirrored; face blendshape names
+ * swapped and the head matrix conjugated by S = diag(−1, 1, 1).
+ */
+export function mirrorPoseFrame(frame: PoseFrame): PoseFrame {
+  const out: PoseFrame = { ...frame, pose: null };
+  if (frame.pose) {
+    const n = frame.pose.world.length;
+    const world: LandmarkTuple[] = new Array<LandmarkTuple>(n);
+    const image: LandmarkTuple[] = new Array<LandmarkTuple>(n);
+    for (let i = 0; i < n; i++) {
+      const src = POSE_MIRROR_INDEX[i] ?? i;
+      const w = frame.pose.world[src];
+      const im = frame.pose.image[src];
+      world[i] = [-w[0] || 0, w[1], w[2], w[3]];
+      image[i] = [1 - im[0], im[1], im[2], im[3]];
+    }
+    out.pose = { world, image };
+  }
+  if (frame.hands !== undefined) {
+    out.hands = frame.hands
+      ? {
+          left: frame.hands.right ? mirrorHandFrame(frame.hands.right) : null,
+          right: frame.hands.left ? mirrorHandFrame(frame.hands.left) : null,
+        }
+      : null;
+  }
+  if (frame.face !== undefined) out.face = frame.face ? mirrorFaceFrame(frame.face) : null;
+  return out;
 }
