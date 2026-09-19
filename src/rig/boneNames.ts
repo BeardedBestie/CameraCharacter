@@ -237,6 +237,8 @@ const TAIL_TOKENS = new Set(['end', 'nub', 'tip', 'endsite', 'eff', 'effector', 
  * tail markers, props and secondary motion bones (hair, skirt, breast, tail...).
  */
 export function isHelperBone(name: string): boolean {
+  // Rigify ORG-/MCH- bones mirror the DEF- hierarchy but carry no skin weights.
+  if (/^(ORG|MCH)[-_]/.test(name)) return true;
   const n = normalizeBoneName(name);
   const key = nameKey(n);
   // Character Creator names its real neck bones NeckTwist01/02.
@@ -325,6 +327,7 @@ const CENTER_LEXICON: Record<string, [CenterRole, number]> = {
   skull: ['head', 0.8],
   jaw: ['jaw', 1],
   jawroot: ['jaw', 0.9],
+  lowerjaw: ['jaw', 0.95],
   chin: ['jaw', 0.6],
   mandible: ['jaw', 0.8],
 };

@@ -103,8 +103,25 @@ class Ctx {
     this.helper = g.nodes.map((n) => isHelperBone(n.name));
     this.tail = g.nodes.map((n) => isTailMarker(n.name));
     this.extent = graphExtent(g) || 1;
-    this.effChildren = g.nodes.map((n) => n.children.filter((c) => !this.helper[c] && !this.tail[c]));
+    this.effChildren = g.nodes.map((n) => this.collectEffective(n.children));
     this.depth = g.nodes.map((_, i) => this.effDepth(i));
+  }
+  /**
+   * Chain children: tail markers dropped, helper bones (twist, IK, hair...)
+   * skipped but passed through so a chain like Daz `lThighBend → lThighTwist →
+   * lShin` still connects thigh and shin.
+   */
+  private collectEffective(children: number[], depthGuard = 0): number[] {
+    const out: number[] = [];
+    for (const c of children) {
+      if (this.tail[c]) continue;
+      if (this.helper[c]) {
+        if (depthGuard < 8) for (const gc of this.collectEffective(this.g.nodes[c].children, depthGuard + 1)) out.push(gc);
+        continue;
+      }
+      out.push(c);
+    }
+    return out;
   }
   private effDepth(i: number): number {
     let best = 0;
@@ -492,6 +509,8 @@ export function analyzeTopology(graph: SkeletonGraph, opts: TopologyOptions = {}
         if (kids.length !== 1) break;
         const d = ctx.link(n, kids[0]);
         if (d.length() > 1e-9 && d.dot(up) / d.length() < 0.5) break;
+        // An unnamed leaf above a neck+head chain is a tail marker (head_end), not the head.
+        if (ctx.effChildren[kids[0]].length === 0 && chain.length >= 2) break;
         n = kids[0];
         chain.push(n);
       }
