@@ -105,6 +105,7 @@ The app also self-checks: after solving, the angle between each measured directi
 | Character Creator 4 | FBX | `CC_Base_*` names; twist bones ignored. |
 | Daz Genesis | FBX | Bend/Twist pairs handled. |
 | Generic Blender | GLB, FBX | `upper_arm.L`, or nameless `Bone.001…` rigs via topology. |
+| Bundled sample pack (`models/characters`) | GLB | 28 game characters from a modular-parts pipeline: Meshy-style names, modular part meshes on one skin, root scaled by 0.01, node transforms posed by an animation (bind pose recovered from the skin), one rig with scrambled spine/neck names (topology decides). Four color variants are unrigged static meshes. |
 
 Any humanoid with hips, a spine, a head, two arms and two legs can be driven. Missing optional bones (shoulders, neck, feet, toes, fingers) are fine.
 
@@ -164,7 +165,12 @@ Testing strategy: the math, mapping and solver are pure and tested in Node, incl
 
 ## Roadmap
 
-Foot IK and ground contact, VRM spring bones, full ARKit blendshape mapping for models that carry them, multi-person tracking, WebGPU rendering, OSC/VMC output for other tools, take management (trimming, multiple takes), scene authoring (camera paths, lights).
+- **Props and weapons in the character's hands.** Attach a prop GLB to a hand socket. The app makes an automatic first pass (grip frame derived from the hand's finger direction and palm normal; the prop's grip axis and pointing direction from its bounding box, the bundled weapon pack's `muzzle`/`length` extras, or a named grip node), then a slider panel lets you correct position, rotation and scale live, and one click exports the corrected offsets as a preset that becomes the new default for that rig family and prop category. Design notes in [`docs/DESIGN.md`](docs/DESIGN.md#16-props-in-hands-and-the-alignment-loop).
+- Foot IK and ground contact, VRM spring bones, full ARKit blendshape mapping for models that carry them, multi-person tracking, WebGPU rendering, OSC/VMC output for other tools, take management (trimming, multiple takes), scene authoring (camera paths, lights).
+
+### How alignment problems are solved in this project
+
+Bone roll trims, prop sockets, camera framing presets and rig quirks all follow the same loop: **the system proposes, the person corrects with direct manipulation, and the correction is persisted as the new default** (and, in aggregate, informs better proposals). This is a mixed-initiative, human-in-the-loop calibration pattern; see the design document for how it is applied.
 
 ## Acknowledgements
 

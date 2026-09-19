@@ -286,4 +286,40 @@ URL parameters for automation and demos: `?source=recording&file=/recordings/arm
 
 ## 15. Roadmap (after v2)
 
-Foot IK / ground contact, VRM spring bones, full ARKit blendshape mapping for models that have them, multi-person, WebGPU renderer, OSC/VMC protocol output for other tools, take management (multiple takes, trimming), scene authoring (camera paths, lights).
+Props and weapons in hands (§16), foot IK / ground contact, VRM spring bones, full ARKit blendshape mapping for models that have them, multi-person, WebGPU renderer, OSC/VMC protocol output for other tools, take management (multiple takes, trimming), scene authoring (camera paths, lights).
+
+## 16. Props in hands and the alignment loop
+
+Goal: put a weapon or prop in the character's hand so it follows the hand naturally, with as little manual alignment as possible, and never redo the alignment for the same kind of rig and prop.
+
+### 16.1 Sockets
+
+A **socket** is a hand role (`leftHand`/`rightHand`; later also `head`, `hips`, `spine` for hats, holsters, backpacks) plus an offset transform in the bone's local space: position, rotation (Euler degrees for the sliders, stored as quaternion), scale. A prop is a loaded `Object3D` parented to the socket bone with that offset. Sockets are stored in the rig profile (`sockets: Record<socketName, SocketOffset>`) and exported/imported with it.
+
+### 16.2 Automatic first pass
+
+The first pass uses what the rig analysis already knows about the hand:
+
+* **Hand frame.** From the hand bone's rest analysis: `f` = finger direction (wrist → fingers), `n` = dorsal normal (back of the hand; palm = −n), `l` = lateral axis `cross(f, n)` (index side → pinky side, sign chosen so the frame is right-handed). Palm center ≈ wrist + 0.35·handLength·f − 0.15·handLength·n. A closed fist encloses a grip whose axis runs along `l`.
+* **Prop frame.** From the prop file, in priority order: (1) a named node such as `grip`, `handle`, `socket_hand`; (2) glTF root `extras` from the bundled weapon pack: `muzzle` (front point) and `length` with the convention origin at the rear end at floor level and the prop extending along −Z; (3) bounding-box heuristics: the long axis is the pointing axis, the rear end is the grip end for one-handed tools.
+* **Category rules.** *Firearm*: barrel direction → `f` (index finger points along the barrel), gun up (+Y) → −`l` (from the grip bottom to the slide), grip point = rear-bottom of the box raised by ~25 % of the height, placed at the palm center. *Melee / tool* (bat, katana): the handle segment (rear 15–25 % of the length) sits across the fist with the handle axis along `l`, blade forward along `f` rotated 60° toward the palm normal for a natural carry. *Small object* (grenade, ammo box): centered in the palm, largest axis along `f`. Two-handed props also get an optional second socket that only applies a look-at constraint for the off hand (no IK in v2).
+
+The result is displayed immediately; typically it is close but not exact because rigs differ in where the hand bone sits relative to the mesh's palm.
+
+### 16.3 Correction sliders and persistence
+
+A **Prop panel** shows six sliders (position x/y/z in centimeters, rotation x/y/z in degrees) and a uniform scale, applied live in the socket's local frame, plus "mirror to other hand", "reset to first pass", "snap rotation to 15°" and a small gizmo in the viewport. **Export** writes a preset:
+
+```json
+{ "format": "cameracharacter-socket-preset", "version": 1,
+  "rigFamily": "game-parts", "rigFingerprint": "…", "socket": "rightHand",
+  "propCategory": "firearm", "propId": "gun_pistol_01",
+  "offset": { "position": [x,y,z], "rotation": [x,y,z,w], "scale": 1 },
+  "firstPass": { … the automatic proposal, kept for comparison … } }
+```
+
+Presets are keyed hierarchically: exact rig fingerprint + prop id → rig family + prop category → prop category only. The most specific match becomes the default on the next load; the difference between the first pass and the accepted offset is stored so the heuristics for that rig family can be re-fitted (the mean correction per family and category is applied as a prior).
+
+### 16.4 The interaction pattern
+
+This is **mixed-initiative, human-in-the-loop calibration**: the system takes the initiative with a proposal (a prior computed from conventions and analysis), the person refines it by **direct manipulation** (sliders and a gizmo rather than numbers or prompts), and the refinement is **persisted as a preset** and folded back into the proposal for the next time (learning from corrections). The same loop is used for bone roll trims, per-bone reference modes, pose calibration, and camera framing. Guidelines that follow from the pattern: the proposal must be visible and editable within seconds; every slider has a reset to the proposal; corrections are exportable and diffable against the proposal; defaults improve without retraining anything (a preset store is enough); the LLM-assisted snapshot loop (§7) is the same pattern one level up, used when the proposal itself needs new rules.
