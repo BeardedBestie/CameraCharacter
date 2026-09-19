@@ -347,3 +347,70 @@ export function fnv1a(str: string): string {
   }
   return h.toString(16).padStart(8, '0');
 }
+
+// ---------------------------------------------------------------------------
+// Up-reference estimators shared by the body model (landmarks) and the rig
+// analysis (bind skeleton), so both sides use identical conventions
+// (docs/DESIGN.md §4).
+// ---------------------------------------------------------------------------
+
+/**
+ * Flexion direction of a joint: the component of the child bone's direction
+ * perpendicular to this bone's direction (where the child swings toward).
+ * Returns null when the joint is straight (|perpendicular| below `minSin`).
+ */
+export function flexionUp(boneDir: Vector3, childDir: Vector3, out = new Vector3(), minSin = 0.05): Vector3 | null {
+  const d = _fuD.copy(boneDir).normalize();
+  const c = _fuC.copy(childDir).normalize();
+  out.copy(c).addScaledVector(d, -c.dot(d));
+  const len = out.length();
+  if (len < minSin) return null;
+  return out.multiplyScalar(1 / len);
+}
+const _fuD = new Vector3();
+const _fuC = new Vector3();
+
+/**
+ * Kneecap direction of a thigh: MINUS the flexion direction (the shin swings
+ * backward, the kneecap points forward). Null when the knee is straight.
+ */
+export function kneecapUp(thighDir: Vector3, shinDir: Vector3, out = new Vector3(), minSin = 0.05): Vector3 | null {
+  const r = flexionUp(thighDir, shinDir, out, minSin);
+  return r ? r.negate() : null;
+}
+
+/**
+ * Dorsal (back-of-hand) normal from the wrist, index base and pinky base:
+ * s · cross(wrist→index, wrist→pinky) with s = +1 for the left hand and −1 for
+ * the right hand. Null when the three points are collinear.
+ */
+export function dorsalNormal(
+  wrist: Vector3,
+  index: Vector3,
+  pinky: Vector3,
+  side: 'left' | 'right',
+  out = new Vector3(),
+): Vector3 | null {
+  _dnA.subVectors(index, wrist);
+  _dnB.subVectors(pinky, wrist);
+  out.crossVectors(_dnA, _dnB);
+  const len = out.length();
+  if (len < 1e-6) return null;
+  out.multiplyScalar((side === 'left' ? 1 : -1) / len);
+  return out;
+}
+const _dnA = new Vector3();
+const _dnB = new Vector3();
+
+/** Bend angle in radians between a bone and its child (0 = straight). */
+export function bendAngle(boneDir: Vector3, childDir: Vector3): number {
+  return angleBetween(boneDir, childDir);
+}
+
+/**
+ * Blend weight for a measured up reference: 0 below `startDeg` of bend
+ * (fallback only), 1 above `endDeg` (measured only), smooth in between.
+ */
+export function bendBlendWeight(bendRad: number, startDeg = 8, endDeg = 20): number {
+  return smoothstep(startDeg * DEG2RAD, endDeg * DEG2RAD, bendRad);
+}

@@ -1,27 +1,32 @@
 /**
- * Canonical humanoid conventions used by rig analysis and the retargeting solver.
+ * Canonical humanoid conventions used by rig analysis and the retargeting solver
+ * (docs/DESIGN.md §4).
  *
  * Frame: three.js world coordinates, Y up, the character faces +Z, the
  * character's LEFT side is at +X (glTF / three.js humanoid convention).
  *
  * For every bone role we define, in a T-pose:
  *   dir  – the direction from the bone's head to its tail (toward its child)
- *   up   – the "up reference": the direction the bone's secondary axis points.
- *          The measured up reference is built the same way by the body model
- *          (see docs/DESIGN.md §6.1), so the pairing (dir, up) fully fixes the
- *          bone's orientation, including twist:
+ *   up   – the up reference. It is defined the same way on landmarks, on a
+ *          rig's bind skeleton and in this table, and it is in-plane and
+ *          side-independent:
  *            hips/spine/neck/head/shoulders : forward (+Z)
- *            upperArm / upperLeg            : the joint's bend direction, i.e. the
- *                                             component of the child's direction
- *                                             perpendicular to this bone (elbows
- *                                             flex forward, knees flex backward)
- *            lowerArm / hand                : the dorsal (back-of-hand) direction
- *            lowerLeg                       : the foot's forward direction
- *            foot / toes                    : up
+ *            upperArm                       : flexion direction = component of
+ *                                             elbow→wrist perpendicular to dir
+ *                                             (fallback torso forward)
+ *            lowerArm / hand                : the dorsal (back-of-hand) normal
+ *            upperLeg                       : kneecap direction = MINUS the
+ *                                             component of knee→ankle
+ *                                             perpendicular to dir (fallback
+ *                                             torso forward)
+ *            lowerLeg                       : component of heel→toe
+ *                                             perpendicular to dir (foot forward)
+ *            foot / toes                    : component of ankle→knee
+ *                                             perpendicular to dir (up)
  *   coneDeg – maximum angle between a rig's bind-pose direction and `dir` for the
- *          bind pose to count as anatomical (see docs/DESIGN.md §4).
+ *          bind pose to count as anatomical.
  *   restDir / restUp – the same basis for a relaxed human standing at rest (arms
- *          hanging), used by the `relative` reference mode.
+ *          hanging, palms facing the thighs), used by the `relative` mode.
  */
 import { Vector3 } from 'three';
 import type { HumanoidBone, Vec3Tuple } from '../core/types';
@@ -43,7 +48,6 @@ const n = (x: number, y: number, z: number): Vec3Tuple => {
 const UP: Vec3Tuple = [0, 1, 0];
 const DOWN: Vec3Tuple = [0, -1, 0];
 const FWD: Vec3Tuple = [0, 0, 1];
-const BACK: Vec3Tuple = [0, 0, -1];
 
 function sideX(bone: HumanoidBone): number {
   return boneSide(bone) === 'right' ? -1 : 1;
@@ -88,8 +92,8 @@ function build(bone: HumanoidBone): CanonicalBone {
       return { dir: along, up: UP, coneDeg: 120, restDir: n(0.1 * s, -0.99, 0.1), restUp: [s, 0, 0] };
     case 'leftUpperLeg':
     case 'rightUpperLeg':
-      // Knee flexes backward.
-      return { dir: DOWN, up: BACK, coneDeg: 60, restDir: DOWN, restUp: BACK };
+      // Kneecap faces forward.
+      return { dir: DOWN, up: FWD, coneDeg: 60, restDir: DOWN, restUp: FWD };
     case 'leftLowerLeg':
     case 'rightLowerLeg':
       // Foot points forward relative to the shin.
@@ -149,3 +153,7 @@ const _tmp = new Vector3();
 
 /** Ordered spine chain roles from the hips upward (excluding hips). */
 export const SPINE_CHAIN: readonly HumanoidBone[] = ['spine', 'chest', 'upperChest'];
+
+/** Bend angle (degrees) at which the measured up reference is fully trusted (blend from 8° to 20°). */
+export const BEND_BLEND_START_DEG = 8;
+export const BEND_BLEND_END_DEG = 20;

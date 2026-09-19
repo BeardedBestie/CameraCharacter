@@ -1,7 +1,7 @@
 /**
- * Core contracts shared by every module. Pure types and constants only; no DOM,
- * no three.js runtime objects, so this file is safe to import from tests,
- * scripts and the browser alike.
+ * Core contracts shared by every module (design revision 2.1). Pure types and
+ * constants only; no DOM, no three.js runtime objects, so this file is safe to
+ * import from tests, scripts and the browser alike.
  */
 
 // ---------------------------------------------------------------------------
@@ -141,14 +141,17 @@ export const REQUIRED_BONES: readonly HumanoidBone[] = [
   'rightLowerLeg',
 ];
 
+export function isFingerBone(bone: HumanoidBone): boolean {
+  return /^(left|right)(Thumb|Index|Middle|Ring|Little)/.test(bone);
+}
+
 /** Roles that make up the "body" (everything except fingers, eyes and jaw). */
 export const BODY_BONES: readonly HumanoidBone[] = HUMANOID_BONES.filter(
   (b) => !isFingerBone(b) && b !== 'leftEye' && b !== 'rightEye' && b !== 'jaw',
 );
 
-export function isFingerBone(bone: HumanoidBone): boolean {
-  return /^(left|right)(Thumb|Index|Middle|Ring|Little)/.test(bone);
-}
+/** The torso chain from the hips upward (roles that default to `relative` mode). */
+export const TORSO_BONES: readonly HumanoidBone[] = ['hips', 'spine', 'chest', 'upperChest', 'neck', 'head'];
 
 export type Side = 'left' | 'right' | 'center';
 
@@ -189,12 +192,14 @@ export type LandmarkTuple = [number, number, number, number];
 export type PointTuple = [number, number, number];
 
 export interface HandFrame {
-  /** 21 hand landmarks in meters relative to the hand's geometric center. */
-  world: PointTuple[];
+  /** 21 hand landmarks in meters relative to the hand's own geometric centre (palm orientation only). */
+  local: PointTuple[];
   /** 21 hand landmarks normalized to the image. */
   image: PointTuple[];
   /** Detection score for the hand, 0..1. */
   score: number;
+  /** Raw MediaPipe handedness label (assumes a mirrored selfie frame; informational). */
+  handedness?: 'Left' | 'Right';
 }
 
 export interface FaceFrame {
@@ -206,9 +211,11 @@ export interface FaceFrame {
 
 export interface PoseFrame {
   v: 2;
-  /** Timestamp in milliseconds, monotonic per source. */
+  /** Video frame media time in milliseconds, monotonic per source. */
   t: number;
-  /** Source identifier, e.g. "mediapipe-web", "python-opencv", "recording". */
+  /** performance.now() at capture (optional; aligns takes with video and clip recorders). */
+  now?: number;
+  /** Source identifier: "mediapipe-web", "python-opencv", "recording", "synthetic". */
   src: string;
   /** Capture size in pixels [width, height]. */
   size: [number, number];
@@ -219,48 +226,62 @@ export interface PoseFrame {
     /** Normalized image landmarks in [0,1]; z roughly in x units. */
     image: LandmarkTuple[];
   } | null;
-  /** Hand landmarks keyed by the subject's anatomical side, when hand tracking is enabled. */
+  /** Hand landmarks keyed by the subject's ANATOMICAL side, when hand tracking is enabled. */
   hands?: { left: HandFrame | null; right: HandFrame | null } | null;
   /** Face blendshapes and head transform, when face tracking is enabled. */
   face?: FaceFrame | null;
 }
 
+export interface CameraMeta {
+  deviceLabel?: string;
+  facingMode?: string;
+  frameRate?: number;
+  /** Vertical field of view in degrees (assumed or user-entered). */
+  vfovDeg?: number;
+}
+
+export interface TrackerMeta {
+  lib: string;
+  version: string;
+  poseModel?: PoseModelVariant;
+  delegate?: 'GPU' | 'CPU';
+  hands?: boolean;
+  face?: boolean;
+  minPoseDetectionConfidence?: number;
+  minTrackingConfidence?: number;
+}
+
+export interface MocapMeta {
+  createdAt: string;
+  source: string;
+  size: [number, number];
+  /** Whether the app was in mirror mode when recorded (informational; frames are raw). */
+  mirror: boolean;
+  /** Approximate camera vertical field of view in degrees if known. */
+  fovDeg?: number;
+  /** Shared time origin for aligning with video and clip recordings. */
+  t0?: { wallclock: string; performanceNow: number };
+  camera?: CameraMeta;
+  tracker?: TrackerMeta;
+  /** Smoothing settings in effect when recorded (frames themselves are unfiltered). */
+  smoothing?: SmoothingSettings;
+  calibration?: PoseCalibration | null;
+  /** The model that was driven while recording, if any. */
+  referenceModel?: { familyKey: string; instanceKey?: string; displayName: string } | null;
+  notes?: string;
+}
+
 export interface MocapRecording {
   format: 'cameracharacter-mocap';
   version: 2;
-  meta: {
-    createdAt: string;
-    source: string;
-    size: [number, number];
-    /** Whether the app was in mirror mode when recorded (informational; frames are raw). */
-    mirror: boolean;
-    /** Free-form notes / device info. */
-    notes?: string;
-    /** Approximate camera vertical field of view in degrees if known. */
-    fovDeg?: number;
-    /** Snapshot of the pose calibration active during the recording, if any. */
-    calibration?: PoseCalibration | null;
-  };
+  meta: MocapMeta;
   frames: PoseFrame[];
 }
 
 // ---------------------------------------------------------------------------
-// Rig profile
+// Numbers stored as plain arrays so profiles and takes serialize to JSON.
 // ---------------------------------------------------------------------------
 
-export type HumanoidMap = Partial<Record<HumanoidBone, string>>;
-
-export type BoneRefMode = 'auto' | 'relative' | 'calibrated' | 'off';
-
-export interface BoneSettings {
-  mode: BoneRefMode;
-  /** Twist trim about the bone axis, degrees. */
-  rollOffsetDeg: number;
-  /** Optional per-bone smoothing override (0..1 fraction of the global rate). */
-  smoothing?: number;
-}
-
-/** Numbers stored as plain arrays so profiles serialize to JSON. */
 export type Vec3Tuple = [number, number, number];
 export type QuatTuple = [number, number, number, number];
 
@@ -271,61 +292,196 @@ export interface RefBasisRecord {
   u: Vec3Tuple;
 }
 
-export interface PoseCalibration {
-  version: 2;
-  createdAt: string;
-  /** Per-role reference bases measured while the user matched the model's rest pose. */
-  bases: Partial<Record<HumanoidBone, RefBasisRecord>>;
-  /** Shoulder width in meters from world landmarks. */
-  shoulderWidth: number;
-  /** Torso length (mid-shoulder to mid-hip) in meters. */
-  torsoLength: number;
-  /** Hip midpoint image y (0..1) while standing at the calibration distance. */
-  standingHipsImageY: number;
-  /** Apparent torso length in normalized image units at the calibration distance. */
-  torsoImageLength: number;
-  /** Number of frames averaged. */
-  frames: number;
+// ---------------------------------------------------------------------------
+// Rig analysis (runtime, recomputed on load) and profile (persisted user intent)
+// ---------------------------------------------------------------------------
+
+export type HumanoidMap = Partial<Record<HumanoidBone, string>>;
+
+/**
+ * auto       – reference from the rig's bind pose (limbs)
+ * relative   – reference = canonical standing rest (torso chain, stub bones)
+ * calibrated – reference measured from the user matching the rig's rest pose
+ * follow     – no measurement; takes the same world delta as its chain's driven bone
+ * off        – keeps the bind pose
+ */
+export type BoneRefMode = 'auto' | 'relative' | 'calibrated' | 'follow' | 'off';
+
+export interface BoneSettings {
+  mode: BoneRefMode;
+  /** Twist trim about the bone axis, degrees, applied in every mode. */
+  rollOffsetDeg: number;
+  /** Optional per-bone smoothing override (multiplier on the global bone rate). */
+  smoothing?: number;
 }
+
+export type RigFamily = 'mixamo' | 'meshy' | 'game-parts' | 'vrm' | 'rigify' | 'ue' | 'cc' | 'daz' | 'smpl' | 'blender' | 'unknown';
 
 export interface RigBoneAnalysis {
   /** Bone (Object3D) name in the loaded model. */
   name: string;
-  /** Rest (bind pose) world direction of the bone, unit, three.js coords, after root correction. */
+  /** Rest (bind pose) world direction of the bone, unit, final scene frame. */
   restDir: Vec3Tuple;
+  /** Bind-derived up reference (same estimator as the body model), or null when the geometry does not define one. */
+  restUp: Vec3Tuple | null;
   /** Rest world quaternion. */
   restQuat: QuatTuple;
   /** Rest world position. */
   restPos: Vec3Tuple;
-  /** Bone length toward the humanoid child or the tail estimate, model units after scaling. */
+  /** Bone length toward the humanoid child or the tail estimate, meters after scaling. */
   length: number;
-  /** Angle (degrees) between the rest direction and the canonical direction. */
+  /** Angle (degrees) between the rest direction and the canonical T-pose direction. */
   canonicalDeviationDeg: number;
   /** True when the rest direction is inside the plausibility cone. */
   anatomical: boolean;
+  /** Mapped humanoid parent and child roles (skipping unmapped intermediates). */
+  parentRole: HumanoidBone | null;
+  childRole: HumanoidBone | null;
+  /** Number of unmapped nodes between this bone and its mapped parent. */
+  intermediateCount: number;
 }
 
-export interface RigProfile {
-  version: 2;
-  /** Hash of the bone hierarchy (sorted "child<parent" pairs). */
-  fingerprint: string;
+export interface RigAxes {
+  /** Detected up and forward axes of the rig in loader space, before correction. */
+  up: Vec3Tuple;
+  forward: Vec3Tuple;
+  /** How facing was decided. */
+  facingSource: 'names' | 'toes' | 'marker' | 'assumed' | 'vrm';
+}
+
+/** Model heights (meters, after scaling) used by the mirror camera; monotonic. */
+export interface HeightTable {
+  floor: number;
+  ankles: number;
+  knees: number;
+  hips: number;
+  shoulders: number;
+  eyes: number;
+  headTop: number;
+}
+
+export interface RigAnalysis {
+  /** Hash of the mapped humanoid subgraph (shared by every rig of the same family). */
+  familyKey: string;
+  /** familyKey + quantized bind-pose signature (distinguishes characters of a family). */
+  instanceKey: string;
   displayName: string;
-  /** Detected rig family, for presets and diagnostics. */
-  family: 'mixamo' | 'meshy' | 'vrm' | 'rigify' | 'ue' | 'cc' | 'daz' | 'blender' | 'unknown';
+  family: RigFamily;
   map: HumanoidMap;
   confidence: Partial<Record<HumanoidBone, number>>;
   warnings: string[];
-  /** Applied to the model root so the rig is Y-up and faces +Z. */
+  axes: RigAxes;
+  /** Applied to the wrapper group so the rig is Y-up and faces +Z. */
   rootCorrection: QuatTuple;
-  /** Applied to the model root so the height matches the target. */
+  /** Applied to the wrapper group so the height matches the target. */
   scale: number;
-  /** Original model height (model units, before scale). */
+  /** Original height in loader units (skeleton bind extents, cross-checked with skinned geometry). */
   sourceHeight: number;
-  /** Per-bone rest analysis, keyed by role. */
+  /** FBX unit scale factor when known (cm = 1). */
+  unitScaleFactor?: number;
   analysis: Partial<Record<HumanoidBone, RigBoneAnalysis>>;
-  /** Per-bone user settings. */
+  heightTable: HeightTable;
+  /** Legs/arms without a usable middle joint (driven as one segment). */
+  noKnee: { left: boolean; right: boolean };
+  noElbow: { left: boolean; right: boolean };
+  /** Whether forearm twist helper bones exist (controls how much pronation the lower arm takes). */
+  hasForearmTwist: { left: boolean; right: boolean };
+  /** Default per-bone settings chosen by the analysis (before the profile diff). */
+  defaultBones: Partial<Record<HumanoidBone, BoneSettings>>;
+  boneCount: number;
+  skinnedMeshCount: number;
+  /** True when the model has no skeleton at all (static mesh). */
+  unrigged: boolean;
+}
+
+export interface SocketOffset {
+  position: Vec3Tuple;
+  rotation: QuatTuple;
+  scale: number;
+}
+
+/** Persisted user intent, applied as a diff over the auto analysis. */
+export interface RigProfile {
+  version: 3;
+  familyKey: string;
+  instanceKey: string;
+  displayName: string;
+  updatedAt: string;
+  /** role -> bone name corrections made by the user. */
+  mapOverrides: HumanoidMap;
+  /** Whether the user swapped left/right relative to the auto result. */
+  swapSides: boolean;
   bones: Partial<Record<HumanoidBone, BoneSettings>>;
-  calibration?: PoseCalibration | null;
+  sockets: Record<string, SocketOffset>;
+  calibration: PoseCalibration | null;
+}
+
+// ---------------------------------------------------------------------------
+// Calibration
+// ---------------------------------------------------------------------------
+
+export type SegmentName = 'upperArm' | 'lowerArm' | 'upperLeg' | 'lowerLeg' | 'shoulderWidth' | 'hipWidth' | 'torso';
+
+export interface PoseCalibration {
+  version: 3;
+  createdAt: string;
+  /** Per-role reference bases measured while the user matched the model's rest pose. */
+  bases: Partial<Record<HumanoidBone, RefBasisRecord>>;
+  /** Standing torso basis (d = up, u = forward) used as the torso reference. */
+  torsoBaseline: RefBasisRecord | null;
+  /** Running-median user segment lengths in meters (world landmarks). */
+  segmentLengths: Partial<Record<SegmentName, number>>;
+  /** Reference depth (meters) at which the user stood during calibration. */
+  zRef: number | null;
+  /** Number of frames averaged. */
+  frames: number;
+}
+
+// ---------------------------------------------------------------------------
+// Framing and takes (contracts between retarget, stage, record and diagnostics)
+// ---------------------------------------------------------------------------
+
+export type FramingState = 'full' | 'waist' | 'bust' | 'face' | 'none';
+
+/** Least-squares fit of image y against user-proportion body height (docs/DESIGN.md §6.4). */
+export interface FramingFit {
+  /** y_img = a * h + b, with h in units of the user's height H (0 = floor, 1 = head top). */
+  a: number;
+  b: number;
+  valid: boolean;
+  /** Visible body span in height units. */
+  visibleTop: number;
+  visibleBottom: number;
+  span: number;
+  state: FramingState;
+}
+
+/** One sampled frame of a retargeted take (roles are indexed by `Take.roles`). */
+export interface TakeSample {
+  /** Seconds since the take started. */
+  t: number;
+  /** Local quaternions of the mapped bones, 4 per role. */
+  local: Float32Array;
+  /** World quaternions of the mapped bones, 4 per role. */
+  world: Float32Array;
+  hipsLocal: Vec3Tuple;
+  hipsWorld: Vec3Tuple;
+}
+
+export interface Take {
+  fps: number;
+  roles: HumanoidBone[];
+  boneNames: string[];
+  /** Bind world quaternions/positions per role (same order as `roles`), final scene frame. */
+  bindWorldQuat: QuatTuple[];
+  bindWorldPos: Vec3Tuple[];
+  /** Mapped parent index per role (-1 for the root). */
+  parentIndex: number[];
+  /** Bone lengths used for BVH end sites. */
+  lengths: number[];
+  samples: TakeSample[];
+  /** performance.now() at start; shared with the landmark and video recorders. */
+  t0: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -336,22 +492,44 @@ export type CameraMode = 'mirror' | 'follow' | 'orbit';
 export type HipsMode = 'locked' | 'horizontal' | 'full';
 export type PoseModelVariant = 'lite' | 'full' | 'heavy';
 
+export interface GateThresholds {
+  on: number;
+  off: number;
+}
+
 export interface SmoothingSettings {
   /** One Euro min cutoff (Hz). Lower = smoother when still. */
   oneEuroMinCutoff: number;
-  /** One Euro beta. Higher = less lag on fast motion. */
+  /** One Euro beta on size-normalized velocity (0..100). Higher = less lag on fast motion. */
   oneEuroBeta: number;
+  /** One Euro derivative cutoff (Hz). */
+  oneEuroDCutoff: number;
   /** Bone rotation response rate (1/s). */
   boneRate: number;
   /** Extra response added at high angular velocity (1/s per rad/s). */
   boneRateVelocityGain: number;
-  /** Visibility gate thresholds. */
-  visibilityOn: number;
-  visibilityOff: number;
-  /** Time a limb holds its last pose after tracking loss before relaxing (ms). */
-  holdMs: number;
+  /** Visibility gate thresholds per landmark group. */
+  gateBody: GateThresholds;
+  gateFeet: GateThresholds;
+  gateFace: GateThresholds;
+  /** A gate opens only after the visibility has been above `on` (and in frame) for this long. */
+  gateDwellMs: number;
+  /** A gate releases after the visibility has been below `off` for this long. */
+  gateReleaseMs: number;
+  /** A gate releases after the landmark has been out of frame for this long. */
+  outOfFrameReleaseMs: number;
+  /** Time a part holds its last pose after tracking loss before relaxing (ms). */
+  poseHoldMs: { arms: number; legs: number; torso: number };
   /** Rate (1/s) at which an untracked bone relaxes toward rest. */
   relaxRate: number;
+  /** Low-pass time constant (s) of the twist state. */
+  twistTau: number;
+  /** Fraction of palm-derived twist applied to the lower arm (rest goes to the hand). */
+  lowerArmTwistFraction: number;
+  /** Confidence ramp after the pose is re-acquired (ms). */
+  reacquireRampMs: number;
+  /** Seconds of confident full-body tracking used for the standing baseline. */
+  standingBaselineSec: number;
 }
 
 export interface TrackingSettings {
@@ -361,6 +539,10 @@ export interface TrackingSettings {
   /** Run hands/face every N pose frames. */
   auxCadence: number;
   delegate: 'GPU' | 'CPU';
+  /** Assumed webcam vertical field of view in degrees (sets the absolute depth scale). */
+  cameraVfovDeg: number;
+  /** Run the face landmarker at full cadence in bust/face framing even when face tracking is off. */
+  closeUpFace: boolean;
 }
 
 export interface StageSettings {
@@ -368,6 +550,8 @@ export interface StageSettings {
   cameraMode: CameraMode;
   hipsMode: HipsMode;
   targetHeight: number;
+  /** Vertical field of view of the mirror camera in degrees. */
+  mirrorCameraFovDeg: number;
   showFloor: boolean;
   showGrid: boolean;
   showLandmarkSkeleton: boolean;
@@ -382,22 +566,40 @@ export interface AppSettings {
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
-  tracking: { poseModel: 'full', hands: false, face: false, auxCadence: 2, delegate: 'GPU' },
+  tracking: {
+    poseModel: 'full',
+    hands: false,
+    face: false,
+    auxCadence: 2,
+    delegate: 'GPU',
+    cameraVfovDeg: 45,
+    closeUpFace: true,
+  },
   smoothing: {
     oneEuroMinCutoff: 1.0,
-    oneEuroBeta: 0.02,
+    oneEuroBeta: 30,
+    oneEuroDCutoff: 1.0,
     boneRate: 14,
     boneRateVelocityGain: 2,
-    visibilityOn: 0.65,
-    visibilityOff: 0.45,
-    holdMs: 250,
+    gateBody: { on: 0.65, off: 0.45 },
+    gateFeet: { on: 0.5, off: 0.3 },
+    gateFace: { on: 0.8, off: 0.6 },
+    gateDwellMs: 150,
+    gateReleaseMs: 250,
+    outOfFrameReleaseMs: 100,
+    poseHoldMs: { arms: 700, legs: 1000, torso: 300 },
     relaxRate: 2,
+    twistTau: 0.3,
+    lowerArmTwistFraction: 0.5,
+    reacquireRampMs: 300,
+    standingBaselineSec: 2,
   },
   stage: {
     mirror: true,
     cameraMode: 'mirror',
     hipsMode: 'horizontal',
     targetHeight: 1.7,
+    mirrorCameraFovDeg: 35,
     showFloor: true,
     showGrid: true,
     showLandmarkSkeleton: false,
@@ -405,3 +607,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
   diagnostics: false,
 };
+
+/** Body heights in units of the user's height H (docs/DESIGN.md §6.4). */
+export const USER_PROPORTIONS = {
+  eyes: 0.94,
+  ears: 0.93,
+  nose: 0.93,
+  shoulders: 0.82,
+  hips: 0.53,
+  knees: 0.28,
+  ankles: 0.04,
+} as const;
