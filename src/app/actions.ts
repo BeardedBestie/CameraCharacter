@@ -145,3 +145,20 @@ export interface Panel<VM> {
   root: HTMLElement;
   update(vm: VM): void;
 }
+
+/** Snapshot of the app state exposed on window.cameraCharacter.getDebugState() for tests and consoles. */
+export interface AppDebugState {
+  ready: boolean;
+  source: { kind: SourceKind; state: string; message?: string };
+  model: { name: string | null; family: string | null; bones: number; warnings: string[]; unrigged: boolean } | null;
+  framesProcessed: number;
+  framesSolved: number;
+  present: boolean;
+  framing: FramingState;
+  /** Max per-bone error (degrees) over the last solved frame, among confident bones. */
+  maxBoneErrorDeg: number | null;
+  meanBoneErrorDeg: number | null;
+  flaggedBones: HumanoidBone[];
+  cameraDistance: number | null;
+  errors: string[];
+}

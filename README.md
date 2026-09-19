@@ -67,29 +67,33 @@ When both agree the confidence is high; topology decides spine order and sides, 
 
 ### Retargeting
 
-For each bone the body model produces a measured basis: a direction (e.g. shoulder → elbow) and an up reference (e.g. the elbow's bend direction, the back of the hand, the foot's forward direction) with a confidence. The rig analysis produces a reference basis for the same bone in the model's bind pose. The solver computes the world rotation taking the reference basis to the measured basis and applies it on top of the bone's bind-pose world orientation, converting to the bone's local space through a solver-maintained parent chain. Bones are solved parents first; unmapped intermediate bones follow their parents. Rotations are smoothed with a velocity-adaptive slerp; twist is damped when the up reference is uncertain.
+The rest pose is the rig's **bind pose**, recovered from the skin's inverse bind matrices against the real parent transform (many exports store an animation frame in the node transforms, and three.js's `Skeleton.pose()` double-applies armature transforms, so neither is used).
+
+For each bone the body model produces a measured basis: a direction (shoulder → elbow) and an up reference with a confidence. Up references are defined the same way everywhere and are independent of the body side: the elbow's flexion direction for the upper arm, the back-of-hand normal for the lower arm and hand, the kneecap direction for the thigh, the foot's forward direction for the shin, up for the foot. For `auto` bones the reference basis is obtained by running the **same estimators on the rig's bind skeleton**, so a rig bound with bent elbows maps your flexion onto its hinge instead of twisting the arm. The solver computes the world rotation taking the reference basis to the measured basis, splits it into swing and twist about the bone axis (twist is low-passed and decays to the bind twist when the up reference is uncertain), applies it on top of the bind-pose world orientation, and converts to local space through a solver-maintained parent chain that composes unmapped intermediate bones. The torso chain is driven relative to a standing baseline so a curved spine or a forward-leaning neck keeps its designed shape.
 
 Reference modes per bone:
 
 | mode | reference | use |
 |---|---|---|
-| `auto` | the model's bind-pose direction | standard rigs (T-pose, A-pose, relaxed) |
-| `relative` | a canonical human standing rest | stylized rigs whose bones are not anatomical; the model shows its own rest pose when you stand normally and your motion is applied as a delta |
+| `auto` | the model's bind pose (direction and up from the bind skeleton) | limbs on standard rigs (T-pose, A-pose, arms down, bent elbows) |
+| `relative` | a canonical standing rest | the torso chain; stub bones; the model shows its own rest pose when you stand normally and your motion is applied as a delta |
 | `calibrated` | measured from you while matching the model's rest pose | escape hatch for unusual rigs or systematic tracking bias |
+| `follow` | none | a stub thigh on a rig without a knee: the whole leg is driven as one segment from hip to ankle |
 
-The rig analysis picks `auto` for bones whose bind-pose direction lies inside an anatomical cone and `relative` otherwise; both are overridable, and a roll trim per bone corrects residual twist.
+The rig analysis chooses modes from the bind pose (anatomical cones, stub detection, no-knee detection); all are overridable, and a roll trim per bone corrects residual twist.
 
 ### Degradation and the mirror camera
 
-Landmark visibilities are smoothed and gated with hysteresis (on above 0.65, off below 0.45, 250 ms hold). A bone whose landmarks are lost holds its pose briefly, then relaxes toward rest. Lost elbows or knees are reconstructed from the shoulder/hip and wrist/ankle with the model's bone lengths. When legs leave the frame the hips stop translating vertically. The status panel shows which parts are tracked.
+Landmark visibilities are smoothed and gated with hysteresis, a dwell time (a single spike never opens a gate), an in-frame test (MediaPipe extrapolates off-frame joints with optimistic visibility) and per-group thresholds (feet are chronically less visible). Filters freeze while a landmark is gated off and restart from the true position when it returns. A limb whose landmarks are lost holds its pose (700 ms arms, 1 s legs), then relaxes toward rest. Lost elbows or knees are reconstructed from the shoulder/hip and wrist/ankle using your own measured segment lengths. Framing states (full, waist, bust, face) decide what is driven: seated users get a pelvis that settles to the shoulder line instead of rocking from hallucinated hip landmarks; a close-up drives the head from the face landmarker. Tracking loss keeps the framing for three seconds before easing to rest.
 
-In mirror camera mode the app measures which part of your body is visible in the image, finds the corresponding heights on the character, and drives the camera distance and target with critically damped springs so the character fills the viewport the way you fill the webcam frame.
+In mirror camera mode the app fits, every frame, a line through the image heights of the visible landmarks against standard body proportions. That gives a continuous estimate of which part of the body the webcam crops, which is mapped onto the character's height table and drives the camera distance and target with critically damped springs, a dead-band and a rate limit, so the character fills the viewport the way you fill the webcam frame without zoom pumping when a knee flickers in and out.
 
 ### Calibration
 
-1. **Rig auto-calibration** on every load (no user action): mapping, bind-pose analysis, unit and facing correction, per-bone mode selection.
-2. **Pose calibration** (optional, about three seconds): the character shows its rest pose next to the webcam preview; you match it, a countdown runs, and the averaged reference bases are stored for you.
-3. **Diagnostic snapshot**: one click captures the webcam frame with landmarks, the 3D view with the measured skeleton overlaid, per-bone error bars, and a JSON bundle (profile, mapping with confidences, rest directions, measured bases, solved directions, settings, versions). Hand it to a developer or paste it to an LLM to diagnose mapping or roll problems on a new rig family; fixes land as lexicon entries, presets, or profile tweaks. This is a development-time loop, not a runtime dependency.
+1. **Rig auto-calibration** on every load (no user action): mapping, bind-pose analysis, unit and facing correction, per-bone mode selection, height table.
+2. **Standing baseline** (automatic, silent): your torso's resting orientation, your segment lengths and your distance are measured from the first seconds of full-body tracking.
+3. **Pose calibration** (optional, about three seconds): the character shows its rest pose next to the webcam preview; you match it, a countdown runs, and the averaged reference bases are stored for you.
+4. **Diagnostic snapshot**: one click captures the webcam frame with landmarks, the 3D view with the measured skeleton overlaid, per-bone error bars, and a JSON bundle (analysis, mapping with confidences, rest directions, measured and reference bases, solved directions, framing state, settings, versions). Hand it to a developer or paste it to an LLM to diagnose mapping or roll problems on a new rig family; fixes land as lexicon entries, presets, or profile tweaks. This is a development-time loop, not a runtime dependency.
 
 The app also self-checks: after solving, the angle between each measured direction and the bone's actual direction is reported, and bones over 5° are highlighted.
 
