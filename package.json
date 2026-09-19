@@ -1,0 +1,35 @@
+{
+  "name": "cameracharacter",
+  "private": true,
+  "version": "2.0.0",
+  "description": "Webcam motion capture that drives rigged 3D humanoid models in the browser, with automatic bone mapping and recording.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "gen:recordings": "tsx scripts/gen-synthetic-mocap.ts",
+    "check": "npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "1.0.1",
+    "@pixiv/three-vrm": "^3.5.5",
+    "three": "^0.186.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^24.0.0",
+    "@types/three": "^0.186.0",
+    "tsx": "^4.20.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

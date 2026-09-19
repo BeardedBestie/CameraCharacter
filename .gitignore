@@ -1,2 +1,14 @@
 .DS_Store
 /.openvibe
+node_modules/
+dist/
+public/mediapipe/
+public/models/mediapipe/
+test-results/
+playwright-report/
+e2e/screenshots/
+*.local
+.vite/
+__pycache__/
+*.pyc
+.venv/
