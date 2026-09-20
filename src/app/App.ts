@@ -829,6 +829,20 @@ export class App implements AppActions {
     this.layout.setPanelCollapsed(!this.layout.isPanelCollapsed());
   }
 
+  /** Stops the render loop and every source, recorder and renderer (used by tests and hot reload). */
+  stop(): void {
+    cancelAnimationFrame(this.rafHandle);
+    this.rafHandle = 0;
+    this.sources?.stop();
+    if (this.takeRecorder.isRecording) this.lastTake = this.takeRecorder.stop();
+    if (this.clipRecorder?.isRecording) this.lastClip = this.clipRecorder.stop();
+    this.clipRecorder = null;
+    if (this.videoRecorder?.isRecording) void this.videoRecorder.stop().catch(() => undefined);
+    this.videoRecorder = null;
+    this.stage?.dispose();
+    this.stage = null;
+  }
+
   private async handleDroppedFiles(files: File[]): Promise<void> {
     for (const file of files) {
       const lower = file.name.toLowerCase();
