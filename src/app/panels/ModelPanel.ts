@@ -102,8 +102,43 @@ export function createModelPanel(store: SettingsStore, actions: AppActions): Pan
   store.subscribe((st) => heightSlider.set(st.stage.targetHeight));
 
   let lastVm: ModelVM | null = null;
+  /**
+   * `update` runs on every periodic panel refresh. The table is rebuilt only
+   * when its structure changes (rows, bone options, columns); the per-bone
+   * error cells update in place. Recreating the rows on every refresh would
+   * replace every bone dropdown ten times a second, which closes an open
+   * dropdown at once and stalls the page with DOM churn.
+   */
+  let tableKey = '';
+  let warningsKey: string | null = null;
+  const errorCells = new Map<HumanoidBone, HTMLElement>();
+
+  function tableStructureKey(vm: ModelVM): string {
+    return JSON.stringify([
+      showAdvanced.value,
+      vm.boneNames,
+      vm.rows.map((r) => [r.role, r.bone, r.confidence, r.mode, r.rollOffsetDeg, r.anatomical, r.overridden]),
+    ]);
+  }
+
+  function setErrorCell(cell: HTMLElement, errorDeg: number | null): void {
+    const text = errorDeg === null ? '' : `${errorDeg.toFixed(0)}°`;
+    const cls = 'conf ' + (errorDeg !== null && errorDeg > 5 ? 'low' : 'high');
+    if (cell.textContent !== text) cell.textContent = text;
+    if (cell.className !== cls) cell.className = cls;
+  }
 
   function render(vm: ModelVM): void {
+    const key = tableStructureKey(vm);
+    if (key === tableKey) {
+      for (const r of vm.rows) {
+        const cell = errorCells.get(r.role);
+        if (cell) setErrorCell(cell, r.errorDeg);
+      }
+      return;
+    }
+    tableKey = key;
+    errorCells.clear();
     clear(table);
     if (!vm.rows.length) return;
     const head = el(
@@ -139,8 +174,9 @@ export function createModelPanel(store: SettingsStore, actions: AppActions): Pan
       roll.addEventListener('change', () => actions.setBoneRoll(r.role, Number(roll.value)));
       cells.push(el('td', {}, modeSel.root), el('td', {}, roll));
     }
-    const errText = r.errorDeg === null ? '' : `${r.errorDeg.toFixed(0)}°`;
-    const errCell = el('td', { class: 'conf ' + (r.errorDeg !== null && r.errorDeg > 5 ? 'low' : 'high'), text: errText });
+    const errCell = el('td');
+    setErrorCell(errCell, r.errorDeg);
+    errorCells.set(r.role, errCell);
     cells.push(errCell);
     if (r.anatomical === false) cells[0]!.style.color = 'var(--warn)';
     return el('tr', {}, ...cells);
@@ -158,8 +194,12 @@ export function createModelPanel(store: SettingsStore, actions: AppActions): Pan
       info.textContent = vm.loading ? `Loading ${vm.name ?? ''}…` : parts.join(' · ') || 'No model loaded.';
       (progress.firstElementChild as HTMLElement).style.width = vm.loading && vm.progress !== null ? `${Math.round(vm.progress * 100)}%` : '0%';
       progress.style.display = vm.loading ? '' : 'none';
-      clear(warnings);
-      for (const w of vm.warnings) warnings.appendChild(el('li', { text: w }));
+      const wk = vm.warnings.join('\n');
+      if (wk !== warningsKey) {
+        warningsKey = wk;
+        clear(warnings);
+        for (const w of vm.warnings) warnings.appendChild(el('li', { text: w }));
+      }
       envInfo.textContent = vm.environmentName ? vm.environmentName : 'No environment.';
       envClear.disabled = !vm.environmentName;
       sec.setBadge(vm.name ? `(${vm.rows.filter((r) => r.bone).length} bones)` : '');

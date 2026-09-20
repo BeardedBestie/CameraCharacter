@@ -6,7 +6,7 @@ Intended uses: interactive art installations, quick character puppeteering, moti
 
 > Status: version 2 is a ground-up rebuild of an earlier prototype. The design is documented in [`docs/DESIGN.md`](docs/DESIGN.md); decisions and their provenance are in [`decisionlog.md`](decisionlog.md).
 >
-> **Verified so far** (automatically, without a webcam): the TypeScript build; 313 unit tests covering the math, the filters, the auto-mapper against eleven rig families and every bundled character file, the solver on synthetic rigs and motion, framing, the mirror camera, BVH round trips and the Python provider; and a Playwright suite that boots the app in headless Chromium, loads the bundled models, drives them from synthetic motion and recorded takes, and checks bone error, framing transitions and camera behaviour.
+> **Verified so far** (automatically, without a webcam): the TypeScript build; 324 unit tests covering the math, the filters, the auto-mapper against eleven rig families and every bundled character file, the solver on synthetic rigs and motion, framing, the mirror camera, BVH round trips and the Python provider; and a Playwright suite that boots the app in headless Chromium, loads the bundled models, drives them from synthetic motion and recorded takes, and checks bone error, framing transitions and camera behaviour.
 > **Not yet verified**: live webcam sessions (MediaPipe on real video, hand/face landmarkers, the face-matrix basis), FBX and VRM files from the wild, the pose-calibration flow, and video/GLB export inside a real browser. Open reviewer findings are listed in [`docs/REVIEW-NOTES.md`](docs/REVIEW-NOTES.md). The first live session with the diagnostic snapshot is the next step.
 
 ## What it does

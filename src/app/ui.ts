@@ -73,13 +73,22 @@ export interface SelectControl<T extends string> {
   setOptions(options: { value: T; label: string }[]): void;
 }
 
+/**
+ * `set` and `setOptions` are no-ops when nothing changed. Panels call them on
+ * every periodic refresh, and replacing a select's options (or re-assigning its
+ * value) while its dropdown is open closes the dropdown immediately.
+ */
 export function select<T extends string>(
   options: { value: T; label: string }[],
   value: T,
   onChange: (v: T) => void,
 ): SelectControl<T> {
   const root = el('select');
+  let current: { value: T; label: string }[] = [];
+  const same = (opts: { value: T; label: string }[]) =>
+    opts.length === current.length && opts.every((o, i) => o.value === current[i]!.value && o.label === current[i]!.label);
   const fill = (opts: { value: T; label: string }[]) => {
+    current = opts.map((o) => ({ value: o.value, label: o.label }));
     clear(root);
     for (const o of opts) root.appendChild(el('option', { value: o.value, text: o.label }));
   };
@@ -89,9 +98,10 @@ export function select<T extends string>(
   return {
     root,
     set: (v) => {
-      root.value = v;
+      if (root.value !== v) root.value = v;
     },
     setOptions: (opts) => {
+      if (same(opts)) return;
       const cur = root.value;
       fill(opts);
       if (opts.some((o) => o.value === cur)) root.value = cur;

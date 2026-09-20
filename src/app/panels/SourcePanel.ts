@@ -139,7 +139,8 @@ export function createSourcePanel(store: SettingsStore, actions: AppActions): Pa
       if (vm.cameraId !== null) cameraSelect.set(vm.cameraId);
       presetSelect.setOptions(vm.presets.map((p) => ({ value: p, label: p })));
       presetSelect.set(vm.preset);
-      wsInput.value = vm.wsUrl;
+      // Never overwrite the URL field while the user is typing in it (its change event fires on blur/Enter).
+      if (document.activeElement !== wsInput && wsInput.value !== vm.wsUrl) wsInput.value = vm.wsUrl;
       recordingName.textContent = vm.recordingName ? `Take: ${vm.recordingName}` : 'No take loaded.';
       if (vm.playback) {
         scrub.dataset.duration = String(vm.playback.durationMs);

@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitest/config';
 import type { Plugin } from 'vite';
 import { cpSync, existsSync, mkdirSync, statSync, createReadStream } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,6 +21,40 @@ function copyMediaPipeWasm(): Plugin {
       if (!existsSync(src)) return;
       mkdirSync(dst, { recursive: true });
       cpSync(src, dst, { recursive: true });
+    },
+  };
+}
+
+/**
+ * @mediapipe/tasks-vision 1.0.1 ends vision_bundle.mjs with a sourceMappingURL
+ * comment naming vision_bundle_mjs.js.map, a file the package does not ship (its
+ * map is vision_bundle.mjs.map). Vite follows the comment when it loads the file
+ * and logs "Failed to load source map" with an ENOENT stack, which reads like a
+ * startup error. This load hook serves the bundle without that comment and hands
+ * Vite the map that does exist next to it, which is what Vite would have done had
+ * the comment been right. The code is otherwise untouched.
+ */
+function mediaPipeSourceMap(): Plugin {
+  const bundle = /[\\/]@mediapipe[\\/]tasks-vision[\\/]vision_bundle\.m?js$/;
+  return {
+    name: 'cameracharacter:mediapipe-sourcemap',
+    enforce: 'pre',
+    async load(id) {
+      const file = id.replace(/[?#].*$/, '');
+      if (!bundle.test(file)) return null;
+      let code: string;
+      try {
+        code = await readFile(file, 'utf8');
+      } catch {
+        return null;
+      }
+      code = code.replace(/^\/\/# sourceMappingURL=.*$/m, '');
+      try {
+        return { code, map: JSON.parse(await readFile(`${file}.map`, 'utf8')) };
+      } catch {
+        // No usable map next to the bundle: tell Vite there are no mappings rather than let it look for one.
+        return { code, map: { mappings: '' } };
+      }
     },
   };
 }
@@ -58,7 +93,7 @@ function serveSampleModels(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [copyMediaPipeWasm(), serveSampleModels()],
+  plugins: [copyMediaPipeWasm(), mediaPipeSourceMap(), serveSampleModels()],
   server: {
     port: 5173,
     strictPort: false,

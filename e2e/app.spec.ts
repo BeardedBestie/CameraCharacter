@@ -110,6 +110,38 @@ test.describe('CameraCharacter (synthetic source)', () => {
     expect(s.errors).toEqual([]);
   });
 
+  test('control panel dropdowns survive the periodic refresh and apply a bone override', async ({ page }) => {
+    const consoleErrors = collectConsoleErrors(page);
+    // No kiosk flag: the panel is visible and refreshes ten times a second while the app runs.
+    await page.goto(`/?source=synthetic&preset=walk&model=${MODEL}&autoplay=1&camera=mirror`);
+    await waitFor(page, (st) => st.ready && !!st.model && st.framesSolved > 30);
+    const boneSelect = page.locator('.mapping-table select').first();
+    await expect(boneSelect).toBeVisible();
+    // Every <select> and <option> in the panel must be the same node after ten refreshes,
+    // otherwise an open dropdown closes as soon as it opens.
+    const stable = await page.evaluate(async () => {
+      const nodes = () => Array.from(document.querySelectorAll('#panel select, #panel select option'));
+      const before = nodes();
+      await new Promise((r) => setTimeout(r, 1000));
+      const after = nodes();
+      return before.length > 20 && before.length === after.length && before.every((n, i) => n === after[i]);
+    });
+    expect(stable).toBe(true);
+    // Picking another bone in the dropdown marks the row as overridden and the app keeps solving.
+    const current = await boneSelect.inputValue();
+    const choices = await boneSelect.locator('option').evaluateAll((os) => os.map((o) => (o as HTMLOptionElement).value));
+    const other = choices.find((v) => v && v !== current);
+    expect(other).toBeTruthy();
+    await boneSelect.selectOption(other!);
+    await expect(page.locator('.mapping-table select').first()).toHaveValue(other!);
+    await expect(page.locator('.mapping-table select').first()).toHaveAttribute('title', 'Overridden by you');
+    const solved = (await debugState(page)).framesSolved;
+    const s = await waitFor(page, (st) => st.framesSolved > solved + 30);
+    expect(s.errors).toEqual([]);
+    const benign = consoleErrors.filter((e) => !/favicon|ERR_INTERNET_DISCONNECTED|net::ERR/i.test(e));
+    expect(benign).toEqual([]);
+  });
+
   test('recording playback source works with a generated take', async ({ page }) => {
     collectConsoleErrors(page);
     await page.goto(`/?source=recording&file=/recordings/squat.mocap.json&model=${MODEL}&autoplay=1&diagnostics=1&loop=1&kiosk=1`);
