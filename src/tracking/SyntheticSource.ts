@@ -158,7 +158,7 @@ export class SyntheticSource extends BaseSource {
     const pose = this.preset.poseAt(presetT);
     const cam = this.preset.cameraAt ? this.preset.cameraAt(presetT) : this.preset.camera;
     const points = computeLandmarkPositions(pose, this.dims);
-    const frame = toPoseFrame(points, cam, k * this.frameMs, {
+    const frame = toPoseFrame(points, cam, (k * 1000) / this.frameRate, {
       size: this.size,
       src: SYNTHETIC_SRC,
       visibilityOverride: pose.visibilityOverride,

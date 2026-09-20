@@ -1,21 +1,30 @@
 /**
- * Automatic humanoid bone mapping: reconciles the name detector and the
- * topology detector (docs/DESIGN.md §5.4) into a `HumanoidMap` with per-role
- * confidence and warnings.
+ * Automatic humanoid bone mapping (docs/DESIGN.md §5.4 "Reconciliation",
+ * §5.6 keys): chain-order roles from the topology detector are the result;
+ * name classes constrain chain membership and decide the two name-driven
+ * choices (inside topology.ts); name-only and preset candidates fill roles the
+ * chains left empty when they are hierarchy-consistent. Also detects the rig
+ * family, no-knee / no-elbow chains, forearm twist helpers and computes the
+ * family/instance keys.
  *
  * Pure: works on a {@link SkeletonGraph}, so it runs in Node.
  */
-import { Vector3 } from 'three';
-import type { HumanoidBone, HumanoidMap, RigProfile } from '../core/types';
-import { HUMANOID_BONES, HUMANOID_PARENT, REQUIRED_BONES, isFingerBone } from '../core/types';
-import { detectFamilyFromNames, scoreNameCandidates, type NameCandidate } from './boneNames';
+import { Quaternion, Vector3 } from 'three';
+import type { HumanoidBone, HumanoidMap, RigAxes, RigFamily, Vec3Tuple } from '../core/types';
+import { HUMANOID_BONES, HUMANOID_PARENT, REQUIRED_BONES, boneSide } from '../core/types';
+import { fnv1a } from '../core/math';
+import { detectFamily, normalizedName, type BoneNameInfo, type FamilyHints } from './boneNames';
 import { presetFor } from './presets';
-import { isDescendant, type SkeletonGraph } from './skeletonGraph';
-import { analyzeTopology, type ArmChain, type FingerChain, type LegChain, type RigAxes, type TopologyResult } from './topology';
+import { isDescendant, subtree, type SkeletonGraph } from './skeletonGraph';
+import { analyzeTopology, rootCorrectionFromAxes, type TopologyResult } from './topology';
 
 export interface AutoMapOptions {
   /** Roles known from the file format (VRM humanoid); they override detection with confidence 1. */
   hint?: HumanoidMap;
+  /** VRM: axes known, facing detector skipped. */
+  vrm?: boolean;
+  /** Loader hints for the family detector. */
+  family?: FamilyHints;
   /** Disable the family preset pass. */
   noPresets?: boolean;
 }
@@ -24,364 +33,344 @@ export interface AutoMapResult {
   map: HumanoidMap;
   confidence: Partial<Record<HumanoidBone, number>>;
   warnings: string[];
-  family: RigProfile['family'];
+  family: RigFamily;
   axes: RigAxes;
-  /** Node index per mapped role (same content as `map`, by index). */
+  /** Unit vector toward the rig's left in loader space. */
+  left: Vec3Tuple;
+  /** Node index per mapped role. */
   roleIndex: Partial<Record<HumanoidBone, number>>;
   topology: TopologyResult;
+  noKnee: { left: boolean; right: boolean };
+  noElbow: { left: boolean; right: boolean };
+  hasForearmTwist: { left: boolean; right: boolean };
+  familyKey: string;
+  instanceKey: string;
+  /** Skeleton extent along the up axis in loader units. */
+  height: number;
+  /** True when the graph has no skin joints at all. */
+  unrigged: boolean;
 }
 
-const CONF_AGREE = 0.95;
-const CONF_AGREE_WEAK = 0.9;
-const CONF_TOPOLOGY = 0.7;
-const CONF_NAME = 0.6;
-const CONF_NAME_OVER_TOPOLOGY = 0.65;
-const CONF_TOPOLOGY_FINGER = 0.5;
+export const CONF_CHAIN_AND_NAME = 0.95;
+export const CONF_CHAIN_ONLY = 0.7;
+export const CONF_NAME_ONLY = 0.6;
+export const CONF_PRESET = 0.6;
+export const CONF_HINT = 1;
 
-type Assign = { index: number; conf: number };
+const SIDED_KEYWORD_ROLE: Record<string, string> = {
+  clavicle: 'Shoulder',
+  clav: 'Shoulder',
+  collar: 'Shoulder',
+  collarbone: 'Shoulder',
+  upperarm: 'UpperArm',
+  arm: 'UpperArm',
+  humerus: 'UpperArm',
+  shldr: 'UpperArm',
+  bicep: 'UpperArm',
+  biceps: 'UpperArm',
+  forearm: 'LowerArm',
+  lowerarm: 'LowerArm',
+  elbow: 'LowerArm',
+  ulna: 'LowerArm',
+  hand: 'Hand',
+  wrist: 'Hand',
+  thigh: 'UpperLeg',
+  upleg: 'UpperLeg',
+  upperleg: 'UpperLeg',
+  femur: 'UpperLeg',
+  hip: 'UpperLeg',
+  shin: 'LowerLeg',
+  calf: 'LowerLeg',
+  lowerleg: 'LowerLeg',
+  tibia: 'LowerLeg',
+  knee: 'LowerLeg',
+  foot: 'Foot',
+  ankle: 'Foot',
+  toe: 'Toes',
+  toes: 'Toes',
+  toebase: 'Toes',
+  ball: 'Toes',
+};
+const CENTER_KEYWORD_ROLE: Record<string, HumanoidBone> = {
+  hips: 'hips',
+  pelvis: 'hips',
+  spine: 'spine',
+  chest: 'chest',
+  upperchest: 'upperChest',
+  neck: 'neck',
+  head: 'head',
+};
 
-const FINGERS = ['Thumb', 'Index', 'Middle', 'Ring', 'Little'] as const;
-const SIDES = ['left', 'right'] as const;
-
-export function autoMapHumanoid(graph: SkeletonGraph, opts: AutoMapOptions = {}): AutoMapResult {
-  const warnings: string[] = [];
-  const names = scoreNameCandidates(graph);
-  const topo = analyzeTopology(graph);
-  for (const w of topo.warnings) warnings.push(w);
-  const assigned = new Map<HumanoidBone, Assign>();
-  const nameOf = (i: number) => graph.nodes[i].name;
-
-  const topName = (role: HumanoidBone): NameCandidate | undefined => names.get(role)?.[0];
-  const isNameCandidate = (role: HumanoidBone, index: number): number => {
-    const list = names.get(role);
-    if (!list) return -1;
-    const pos = list.findIndex((c) => c.index === index);
-    return pos;
-  };
-  const set = (role: HumanoidBone, index: number, conf: number) => assigned.set(role, { index, conf });
-  const conflictWarn = (role: HumanoidBone, chosen: number, other: number, chosenBy: string) =>
-    warnings.push(`${role}: name detector and topology disagree ('${nameOf(chosen)}' by ${chosenBy} vs '${nameOf(other)}'); using '${nameOf(chosen)}'.`);
-
-  // Confidence for a topology pick given the name candidates for the role (or sibling roles).
-  const reconcileTorso = (role: HumanoidBone, index: number, altRoles: HumanoidBone[] = []) => {
-    const pos = isNameCandidate(role, index);
-    if (pos === 0) return set(role, index, CONF_AGREE);
-    if (pos > 0) return set(role, index, CONF_AGREE_WEAK);
-    for (const alt of altRoles) if (isNameCandidate(alt, index) >= 0) return set(role, index, CONF_AGREE_WEAK);
-    return set(role, index, CONF_TOPOLOGY);
-  };
-
-  // ---------------------------------------------------------------- hips
-  const nameHips = topName('hips');
-  if (topo.hips !== undefined) {
-    reconcileTorso('hips', topo.hips);
-    if (nameHips && nameHips.index !== topo.hips && isNameCandidate('hips', topo.hips) < 0) {
-      conflictWarn('hips', topo.hips, nameHips.index, 'topology');
-    }
-  } else if (nameHips) {
-    set('hips', nameHips.index, CONF_NAME);
+/** Role a bone name suggests on its own (name-only candidate), or null. */
+export function nameOnlyRole(info: BoneNameInfo): HumanoidBone | null {
+  if (!info.keyword) return null;
+  if (info.group === 'torso') return CENTER_KEYWORD_ROLE[info.keyword] ?? null;
+  if ((info.group === 'arm' || info.group === 'leg') && (info.side === 'left' || info.side === 'right')) {
+    const suffix = SIDED_KEYWORD_ROLE[info.keyword];
+    if (!suffix) return null;
+    if (info.keyword === 'shoulder') return null; // the shoulder-vs-upperArm rule is chain-driven
+    return `${info.side}${suffix}` as HumanoidBone;
   }
-  const hips = assigned.get('hips')?.index;
-
-  // ---------------------------------------------------------------- spine chain
-  let spineChain: number[] = [];
-  if (topo.hips !== undefined) {
-    spineChain = topo.spineChain;
-  } else if (hips !== undefined) {
-    // Names only: spine-ish candidates under the hips ordered by depth.
-    const cands = new Set<number>();
-    for (const r of ['spine', 'chest', 'upperChest'] as HumanoidBone[]) for (const c of names.get(r) ?? []) if (isDescendant(graph, c.index, hips)) cands.add(c.index);
-    spineChain = [...cands].sort((a, b) => depthOf(graph, a) - depthOf(graph, b));
-    // Keep only a single ancestor line.
-    spineChain = spineChain.filter((n, i) => i === 0 || isDescendant(graph, n, spineChain[i - 1]) || spineChain.slice(0, i).every((p) => isDescendant(graph, n, p)));
+  if (info.group === 'finger' && info.finger && info.finger.segment && info.finger.segment !== 'Tip' && (info.side === 'left' || info.side === 'right')) {
+    if (info.finger.digit !== 'Thumb' && info.finger.segment === 'Metacarpal') return null;
+    if (info.finger.digit === 'Thumb' && info.finger.segment === 'Intermediate') return null;
+    return `${info.side}${info.finger.digit}${info.finger.segment}` as HumanoidBone;
   }
-  const spineRoles = spineRolesFor(spineChain.length);
-  spineChain.forEach((index, i) => {
-    const role = spineRoles[i];
-    if (role) reconcileTorso(role, index, ['spine', 'chest', 'upperChest']);
-  });
-  const branch = spineChain.length ? spineChain[spineChain.length - 1] : hips;
-
-  // ---------------------------------------------------------------- neck / head
-  {
-    const armRoots = new Set<number>();
-    for (const s of SIDES) {
-      const a = topo.arms[s];
-      if (a) for (const n of a.chain) armRoots.add(n);
-    }
-    const underTorso = (i: number) => branch === undefined || isDescendant(graph, i, branch);
-    const nameHead = (names.get('head') ?? []).find((c) => underTorso(c.index) && !armRoots.has(c.index));
-    const nameNeck = (names.get('neck') ?? []).find((c) => underTorso(c.index) && !armRoots.has(c.index));
-    let head: number | undefined;
-    let neck: number | undefined;
-    if (nameHead) {
-      head = nameHead.index;
-      if (topo.head !== undefined && topo.head !== head) conflictWarn('head', head, topo.head, 'name');
-      set('head', head, topo.head === head ? CONF_AGREE : topo.head === undefined ? CONF_NAME : CONF_NAME_OVER_TOPOLOGY);
-    } else if (topo.head !== undefined) {
-      head = topo.head;
-      set('head', head, CONF_TOPOLOGY);
-    }
-    if (nameNeck && (head === undefined || isDescendant(graph, head, nameNeck.index))) {
-      neck = nameNeck.index;
-      if (topo.neck !== undefined && topo.neck !== neck) conflictWarn('neck', neck, topo.neck, 'name');
-      set('neck', neck, topo.neck === neck ? CONF_AGREE : topo.neck === undefined ? CONF_NAME : CONF_NAME_OVER_TOPOLOGY);
-    } else if (topo.neck !== undefined && (head === undefined || isDescendant(graph, head, topo.neck))) {
-      set('neck', topo.neck, CONF_TOPOLOGY);
-    }
-    // Jaw / eyes: names only, under the head.
-    for (const role of ['jaw', 'leftEye', 'rightEye'] as HumanoidBone[]) {
-      const c = (names.get(role) ?? []).find((x) => head === undefined || isDescendant(graph, x.index, head));
-      if (c) set(role, c.index, head === undefined ? CONF_NAME * 0.8 : CONF_NAME);
-    }
-  }
-
-  // ---------------------------------------------------------------- limbs
-  for (const side of SIDES) {
-    const arm = topo.arms[side];
-    const leg = topo.legs[side];
-    reconcileChain(
-      graph,
-      names,
-      assigned,
-      warnings,
-      [`${side}Shoulder`, `${side}UpperArm`, `${side}LowerArm`, `${side}Hand`] as HumanoidBone[],
-      arm ? [arm.shoulder, arm.upperArm, arm.lowerArm, arm.hand] : [undefined, undefined, undefined, undefined],
-      branch,
-    );
-    reconcileChain(
-      graph,
-      names,
-      assigned,
-      warnings,
-      [`${side}UpperLeg`, `${side}LowerLeg`, `${side}Foot`, `${side}Toes`] as HumanoidBone[],
-      leg ? [leg.upperLeg, leg.lowerLeg, leg.foot, leg.toes] : [undefined, undefined, undefined, undefined],
-      hips,
-    );
-    mapFingers(graph, names, assigned, side, arm);
-  }
-
-  // ---------------------------------------------------------------- hint (VRM humanoid)
-  if (opts.hint) {
-    for (const [role, name] of Object.entries(opts.hint) as [HumanoidBone, string][]) {
-      const node = graph.nodes.find((n) => n.name === name);
-      if (node) set(role, node.index, 1);
-    }
-  }
-
-  // ---------------------------------------------------------------- family + presets
-  const allNames = graph.nodes.map((n) => n.name);
-  const family = detectFamilyFromNames(allNames);
-  if (!opts.noPresets && !opts.hint) {
-    const preset = presetFor(family, allNames);
-    if (preset) {
-      for (const [role, name] of Object.entries(preset.map) as [HumanoidBone, string][]) {
-        const node = graph.nodes.find((n) => n.name === name);
-        if (!node) continue;
-        const cur = assigned.get(role);
-        if (cur && cur.index !== node.index) warnings.push(`${role}: preset '${preset.name}' overrides '${nameOf(cur.index)}' with '${name}'.`);
-        set(role, node.index, Math.max(cur?.conf ?? 0, 0.98));
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------- consistency
-  enforceUnique(graph, assigned, warnings);
-  enforceHierarchy(graph, assigned, warnings);
-
-  // Sides vs axes: the mapped left side must be at up × forward.
-  const axes: RigAxes = { up: [...topo.axes.up] as RigAxes['up'], forward: [...topo.axes.forward] as RigAxes['forward'] };
-  {
-    const up = new Vector3().fromArray(axes.up);
-    const fwd = new Vector3().fromArray(axes.forward);
-    const left = new Vector3().crossVectors(up, fwd);
-    const acc = new Vector3();
-    for (const [l, r] of [
-      ['leftUpperLeg', 'rightUpperLeg'],
-      ['leftUpperArm', 'rightUpperArm'],
-      ['leftShoulder', 'rightShoulder'],
-    ] as [HumanoidBone, HumanoidBone][]) {
-      const a = assigned.get(l);
-      const b = assigned.get(r);
-      if (a && b) acc.add(new Vector3().fromArray(graph.nodes[a.index].restPos).sub(new Vector3().fromArray(graph.nodes[b.index].restPos)));
-    }
-    if (acc.length() > 1e-6 && acc.dot(left) < 0) {
-      warnings.push('Mapped left/right bones are on the opposite side of the detected facing; flipping the forward axis.');
-      axes.forward = [-axes.forward[0], -axes.forward[1], -axes.forward[2]];
-    }
-  }
-
-  for (const role of REQUIRED_BONES) if (!assigned.has(role)) warnings.push(`Required role '${role}' is not mapped.`);
-
-  const map: HumanoidMap = {};
-  const confidence: Partial<Record<HumanoidBone, number>> = {};
-  const roleIndex: Partial<Record<HumanoidBone, number>> = {};
-  for (const role of HUMANOID_BONES) {
-    const a = assigned.get(role);
-    if (!a) continue;
-    map[role] = nameOf(a.index);
-    confidence[role] = Math.round(a.conf * 100) / 100;
-    roleIndex[role] = a.index;
-    if (allNames.filter((n) => n === map[role]).length > 1) warnings.push(`Bone name '${map[role]}' (${role}) is not unique in the hierarchy.`);
-  }
-  return { map, confidence, warnings, family, axes, roleIndex, topology: topo };
+  return null;
 }
 
-/** Roles for a spine chain of `n` links from the hips upward (docs/DESIGN.md §5.4). */
-export function spineRolesFor(n: number): (HumanoidBone | null)[] {
-  if (n <= 0) return [];
-  if (n === 1) return ['spine'];
-  if (n === 2) return ['spine', 'chest'];
-  if (n === 3) return ['spine', 'chest', 'upperChest'];
-  const out: (HumanoidBone | null)[] = new Array(n).fill(null);
-  out[0] = 'spine';
-  out[n - 2] = 'chest';
-  out[n - 1] = 'upperChest';
+/** Nearest mapped ancestor role in the humanoid chain. */
+function mappedParentRole(role: HumanoidBone, roleIndex: Partial<Record<HumanoidBone, number>>): HumanoidBone | null {
+  let p = HUMANOID_PARENT[role];
+  while (p && roleIndex[p] === undefined) p = HUMANOID_PARENT[p];
+  return p;
+}
+
+/** Mapped roles whose nearest mapped humanoid ancestor is `role`. */
+function mappedChildRoles(role: HumanoidBone, roleIndex: Partial<Record<HumanoidBone, number>>): HumanoidBone[] {
+  const out: HumanoidBone[] = [];
+  for (const b of HUMANOID_BONES) {
+    if (roleIndex[b] === undefined || b === role) continue;
+    if (mappedParentRole(b, roleIndex) === role) out.push(b);
+  }
   return out;
 }
 
-function depthOf(graph: SkeletonGraph, i: number): number {
-  let d = 0;
-  let p = graph.nodes[i].parent;
-  while (p >= 0) {
-    d++;
-    p = graph.nodes[p].parent;
+/**
+ * Hierarchy consistency of a candidate: it must descend from the bone of its
+ * mapped parent role and be an ancestor of the bones of its mapped child roles.
+ */
+export function isHierarchyConsistent(graph: SkeletonGraph, role: HumanoidBone, index: number, roleIndex: Partial<Record<HumanoidBone, number>>): boolean {
+  const parentRole = mappedParentRole(role, roleIndex);
+  if (parentRole) {
+    const pi = roleIndex[parentRole]!;
+    if (pi !== index && !isDescendant(graph, index, pi)) return false;
   }
-  return d;
+  for (const child of mappedChildRoles(role, roleIndex)) {
+    const ci = roleIndex[child]!;
+    if (ci !== index && !isDescendant(graph, ci, index)) return false;
+  }
+  return true;
+}
+
+export function autoMapHumanoid(graph: SkeletonGraph, opts: AutoMapOptions = {}): AutoMapResult {
+  const warnings: string[] = [];
+  const topo = analyzeTopology(graph, { vrm: opts.vrm });
+  for (const w of topo.warnings) warnings.push(w);
+  const names = graph.nodes.map((n) => n.name);
+  const unrigged = !graph.nodes.some((n) => n.isJoint) && graph.skinnedMeshCount === 0;
+
+  // Duplicate names cannot be addressed by a name map.
+  const seen = new Map<string, number>();
+  for (const n of graph.nodes) seen.set(n.name, (seen.get(n.name) ?? 0) + 1);
+  const duplicates = [...seen.entries()].filter(([, c]) => c > 1).map(([n]) => n);
+  if (duplicates.length) warnings.push(`Duplicate node names (${duplicates.slice(0, 5).join(', ')}${duplicates.length > 5 ? ', …' : ''}); mapping uses the first occurrence.`);
+
+  const roleIndex: Partial<Record<HumanoidBone, number>> = {};
+  const confidence: Partial<Record<HumanoidBone, number>> = {};
+  const usedIndex = new Set<number>();
+  const assign = (role: HumanoidBone, index: number, conf: number) => {
+    const prev = roleIndex[role];
+    if (prev !== undefined) usedIndex.delete(prev);
+    roleIndex[role] = index;
+    confidence[role] = conf;
+    usedIndex.add(index);
+  };
+
+  // 1. Chain-order roles.
+  for (const [index, role] of topo.roles) {
+    if (roleIndex[role] !== undefined) continue;
+    assign(role, index, topo.nameAgrees.get(index) ? CONF_CHAIN_AND_NAME : CONF_CHAIN_ONLY);
+  }
+  if (topo.sideSource === 'geometry' && topo.hips >= 0) {
+    // Sided names that disagree with the geometric sides lower the confidence.
+    for (const role of Object.keys(roleIndex) as HumanoidBone[]) {
+      const side = boneSide(role);
+      if (side === 'center') continue;
+      const s = topo.info[roleIndex[role]!].side;
+      if (s && s !== 'center' && s !== side) {
+        confidence[role] = Math.min(confidence[role] ?? CONF_CHAIN_ONLY, CONF_CHAIN_ONLY);
+        warnings.push(`Bone '${names[roleIndex[role]!]}' is named ${s} but sits on the ${side} side; mapped by position.`);
+      }
+    }
+  }
+
+  // 2. Format hints (VRM humanoid) override everything.
+  if (opts.hint) {
+    for (const [role, name] of Object.entries(opts.hint) as [HumanoidBone, string][]) {
+      if (!name) continue;
+      const idx = names.indexOf(name);
+      if (idx < 0) continue;
+      for (const r of Object.keys(roleIndex) as HumanoidBone[]) if (roleIndex[r] === idx && r !== role) delete roleIndex[r];
+      assign(role, idx, CONF_HINT);
+    }
+  }
+
+  // 3. Name-only candidates for roles the chains left empty (unique, hierarchy-consistent).
+  {
+    const byRole = new Map<HumanoidBone, number[]>();
+    graph.nodes.forEach((_, i) => {
+      if (topo.kinds[i] !== 'link' || usedIndex.has(i)) return;
+      const role = nameOnlyRole(topo.info[i]);
+      if (!role || roleIndex[role] !== undefined) return;
+      const list = byRole.get(role) ?? [];
+      list.push(i);
+      byRole.set(role, list);
+    });
+    for (const [role, list] of byRole) {
+      if (list.length !== 1) continue;
+      const i = list[0];
+      if (!isHierarchyConsistent(graph, role, i, roleIndex)) {
+        warnings.push(`Name candidate '${names[i]}' for ${role} contradicts the detected hierarchy; dropped.`);
+        continue;
+      }
+      assign(role, i, CONF_NAME_ONLY);
+    }
+  }
+
+  // 4. Family and presets.
+  const family = detectFamily(names, { ...opts.family, vrm: opts.vrm || opts.family?.vrm });
+  if (!opts.noPresets) {
+    const preset = presetFor(family, names);
+    if (preset) {
+      for (const [role, name] of Object.entries(preset.map) as [HumanoidBone, string][]) {
+        if (roleIndex[role] !== undefined) continue;
+        const idx = names.indexOf(name);
+        if (idx < 0 || usedIndex.has(idx) || topo.kinds[idx] !== 'link') continue;
+        if (!isHierarchyConsistent(graph, role, idx, roleIndex)) continue;
+        assign(role, idx, CONF_PRESET);
+      }
+    }
+  }
+
+  // 5. Required roles.
+  const map: HumanoidMap = {};
+  for (const role of HUMANOID_BONES) if (roleIndex[role] !== undefined) map[role] = names[roleIndex[role]!];
+  if (!unrigged) {
+    const missing = REQUIRED_BONES.filter((r) => map[r] === undefined);
+    if (missing.length) warnings.push(`Required roles not mapped: ${missing.join(', ')}.`);
+    if (!map.spine && !map.chest && !map.upperChest && map.hips) warnings.push('No spine/chest bone mapped; the torso is driven by the hips alone.');
+  }
+
+  // 6. No-knee / no-elbow chains, forearm twist helpers.
+  const up = new Vector3().fromArray(topo.axes.up);
+  const pos = (i: number) => new Vector3().fromArray(graph.nodes[i].restPos);
+  const childEnd = (i: number): Vector3 | null => {
+    // Farthest descendant position along the chain (for a lower segment without a mapped child).
+    const desc = subtree(graph, i).filter((d) => topo.kinds[d] !== 'passthrough');
+    if (!desc.length) return null;
+    let best = desc[0];
+    let bestD = -1;
+    for (const d of desc) {
+      const dd = pos(d).distanceTo(pos(i));
+      if (dd > bestD) {
+        bestD = dd;
+        best = d;
+      }
+    }
+    return pos(best);
+  };
+  const noKnee = { left: false, right: false };
+  const noElbow = { left: false, right: false };
+  const hasForearmTwist = { left: false, right: false };
+  for (const side of ['left', 'right'] as const) {
+    const ul = roleIndex[`${side}UpperLeg`];
+    const ll = roleIndex[`${side}LowerLeg`];
+    if (ul !== undefined && ll !== undefined) {
+      const ft = roleIndex[`${side}Foot`];
+      const pUl = pos(ul);
+      const pLl = pos(ll);
+      const end = ft !== undefined ? pos(ft) : childEnd(ll);
+      if (end) {
+        const upperLen = pUl.distanceTo(pLl);
+        const lowerLen = pLl.distanceTo(end);
+        const legLen = upperLen + lowerLen;
+        const drop = pUl.dot(up) - pLl.dot(up);
+        if (legLen > 0 && (upperLen < 0.3 * lowerLen || drop < 0.2 * legLen)) {
+          noKnee[side] = true;
+          warnings.push(`Rig has no knee joint on the ${side} leg ('${names[ul]}' is a stub); leg driven as one segment.`);
+        }
+      }
+    }
+    const ua = roleIndex[`${side}UpperArm`];
+    const la = roleIndex[`${side}LowerArm`];
+    if (ua !== undefined && la !== undefined) {
+      const hd = roleIndex[`${side}Hand`];
+      const pUa = pos(ua);
+      const pLa = pos(la);
+      const end = hd !== undefined ? pos(hd) : childEnd(la);
+      if (end) {
+        const upperLen = pUa.distanceTo(pLa);
+        const lowerLen = pLa.distanceTo(end);
+        const armLen = upperLen + lowerLen;
+        if (armLen > 0 && (upperLen < 0.3 * lowerLen || upperLen < 0.2 * armLen)) {
+          noElbow[side] = true;
+          warnings.push(`Rig has no elbow joint on the ${side} arm ('${names[ua]}' is a stub); arm driven as one segment.`);
+        }
+      }
+      hasForearmTwist[side] = subtree(graph, la).some((d) => topo.info[d].twist);
+    }
+  }
+
+  // 7. Keys.
+  const { familyKey, instanceKey } = computeKeys(graph, roleIndex, topo.axes, topo.height);
+
+  return {
+    map,
+    confidence,
+    warnings,
+    family,
+    axes: topo.axes,
+    left: topo.left,
+    roleIndex,
+    topology: topo,
+    noKnee,
+    noElbow,
+    hasForearmTwist,
+    familyKey,
+    instanceKey,
+    height: topo.height,
+    unrigged,
+  };
 }
 
 /**
- * Reconciles one limb chain (shoulder?, upperArm, lowerArm, hand or upperLeg,
- * lowerLeg, foot, toes) between the topology picks and the name picks.
+ * `familyKey` = hash of the mapped humanoid subgraph (role -> normalized bone
+ * name and role parent relations). `instanceKey` = familyKey + quantized bind
+ * signature (per mapped bone: rest direction toward the mapped child rounded
+ * to 5° and length rounded to 1 cm in height-normalized units, both in the
+ * corrected Y-up / +Z frame).
  */
-function reconcileChain(
-  graph: SkeletonGraph,
-  names: Map<HumanoidBone, NameCandidate[]>,
-  assigned: Map<HumanoidBone, Assign>,
-  warnings: string[],
-  roles: HumanoidBone[],
-  topo: (number | undefined)[],
-  root: number | undefined,
-): void {
-  const nameOf = (i: number) => graph.nodes[i].name;
-  // Name picks: best candidate per role, distinct nodes, under the torso root.
-  const used = new Set<number>();
-  const namePick: (number | undefined)[] = roles.map(() => undefined);
-  const order = [...roles.keys()].sort((a, b) => (names.get(roles[b])?.[0]?.score ?? 0) - (names.get(roles[a])?.[0]?.score ?? 0));
-  for (const k of order) {
-    const list = names.get(roles[k]) ?? [];
-    const c = list.find((x) => !used.has(x.index) && (root === undefined || isDescendant(graph, x.index, root)));
-    if (c) {
-      namePick[k] = c.index;
-      used.add(c.index);
-    }
+export function computeKeys(graph: SkeletonGraph, roleIndex: Partial<Record<HumanoidBone, number>>, axes: RigAxes, height: number): { familyKey: string; instanceKey: string } {
+  const lines: string[] = [];
+  for (const role of HUMANOID_BONES) {
+    const i = roleIndex[role];
+    if (i === undefined) continue;
+    const parent = mappedParentRole(role, roleIndex);
+    lines.push(`${role}:${normalizedName(graph.nodes[i].name)}<${parent ?? ''}`);
   }
-  // Consistency: defined name picks must form a strict ancestor chain in role order.
-  let consistent = true;
-  const defined = namePick.map((v, k) => [v, k] as const).filter(([v]) => v !== undefined) as [number, number][];
-  for (let i = 1; i < defined.length; i++) {
-    if (!isDescendant(graph, defined[i][0], defined[i - 1][0])) consistent = false;
-  }
-  if (!consistent) warnings.push(`${roles[0]}..${roles[roles.length - 1]}: name candidates are not in hierarchy order (${defined.map(([v]) => `'${nameOf(v)}'`).join(' > ')}); using topology.`);
+  lines.sort();
+  const familyKey = fnv1a(lines.join('\n'));
 
-  for (let k = 0; k < roles.length; k++) {
-    const role = roles[k];
-    const t = topo[k];
-    const n = consistent ? namePick[k] : undefined;
-    if (t !== undefined && n !== undefined) {
-      if (t === n) assigned.set(role, { index: t, conf: CONF_AGREE });
-      else {
-        warnings.push(`${role}: name detector says '${nameOf(n)}', topology says '${nameOf(t)}'; using the name.`);
-        assigned.set(role, { index: n, conf: CONF_NAME_OVER_TOPOLOGY });
-      }
-    } else if (t !== undefined) {
-      // Topology pick not named for this role: verify it is not named as another body role.
-      assigned.set(role, { index: t, conf: CONF_TOPOLOGY });
-    } else if (n !== undefined) {
-      assigned.set(role, { index: n, conf: CONF_NAME });
-    }
+  const q = rootCorrectionFromAxes(axes, new Quaternion());
+  const h = height > 0 ? height : 1;
+  const corrected = (i: number) => new Vector3().fromArray(graph.nodes[i].restPos).applyQuaternion(q);
+  const sig: string[] = [];
+  for (const role of HUMANOID_BONES) {
+    const i = roleIndex[role];
+    if (i === undefined) continue;
+    const childRole = mappedChildRoles(role, roleIndex).find((c) => boneSide(c) === boneSide(role) || boneSide(role) === 'center');
+    if (!childRole) continue;
+    const d = corrected(roleIndex[childRole]!).sub(corrected(i));
+    const len = d.length();
+    if (len < 1e-9) continue;
+    d.multiplyScalar(1 / len);
+    const theta = Math.round((Math.acos(Math.max(-1, Math.min(1, d.y))) * 180) / Math.PI / 5) * 5;
+    let phi = Math.round((Math.atan2(d.x, d.z) * 180) / Math.PI / 5) * 5;
+    if (phi <= -180) phi += 360;
+    if (theta === 0 || theta === 180) phi = 0;
+    sig.push(`${role}:${theta},${phi},${(len / h).toFixed(2)}`);
   }
+  const instanceKey = `${familyKey}-${fnv1a(sig.join('\n'))}`;
+  return { familyKey, instanceKey };
 }
-
-function mapFingers(
-  graph: SkeletonGraph,
-  names: Map<HumanoidBone, NameCandidate[]>,
-  assigned: Map<HumanoidBone, Assign>,
-  side: 'left' | 'right',
-  arm: ArmChain | undefined,
-): void {
-  const hand = assigned.get(`${side}Hand`)?.index;
-  const underHand = (i: number) => hand === undefined || isDescendant(graph, i, hand);
-  let anyByName = false;
-  for (const finger of FINGERS) {
-    const segs = finger === 'Thumb' ? ['Metacarpal', 'Proximal', 'Distal'] : ['Proximal', 'Intermediate', 'Distal'];
-    for (const seg of segs) {
-      const role = `${side}${finger}${seg}` as HumanoidBone;
-      const c = (names.get(role) ?? []).find((x) => underHand(x.index));
-      if (c) {
-        assigned.set(role, { index: c.index, conf: CONF_NAME });
-        anyByName = true;
-      }
-    }
-  }
-  if (anyByName || !arm || arm.fingers.length === 0) return;
-  for (const chain of arm.fingers) applyFingerChain(assigned, side, chain);
-}
-
-function applyFingerChain(assigned: Map<HumanoidBone, Assign>, side: 'left' | 'right', chain: FingerChain): void {
-  const segs = chain.finger === 'Thumb' ? ['Metacarpal', 'Proximal', 'Distal'] : ['Proximal', 'Intermediate', 'Distal'];
-  const links = chain.links.slice(0, 3);
-  links.forEach((index, i) => {
-    const role = `${side}${chain.finger}${segs[i]}` as HumanoidBone;
-    if (!assigned.has(role)) assigned.set(role, { index, conf: CONF_TOPOLOGY_FINGER });
-  });
-}
-
-/** A node may hold only one role: keep the most confident (required roles win ties). */
-function enforceUnique(graph: SkeletonGraph, assigned: Map<HumanoidBone, Assign>, warnings: string[]): void {
-  const byNode = new Map<number, HumanoidBone[]>();
-  for (const [role, a] of assigned) {
-    const list = byNode.get(a.index) ?? [];
-    list.push(role);
-    byNode.set(a.index, list);
-  }
-  for (const [index, roles] of byNode) {
-    if (roles.length < 2) continue;
-    roles.sort((a, b) => {
-      const ca = assigned.get(a)!.conf + (REQUIRED_BONES.includes(a) ? 0.01 : 0);
-      const cb = assigned.get(b)!.conf + (REQUIRED_BONES.includes(b) ? 0.01 : 0);
-      return cb - ca;
-    });
-    for (const r of roles.slice(1)) {
-      assigned.delete(r);
-      warnings.push(`'${graph.nodes[index].name}' was mapped to both ${roles[0]} and ${r}; dropped ${r}.`);
-    }
-  }
-}
-
-/** Every mapped role must be a descendant of its nearest mapped ancestor role. */
-function enforceHierarchy(graph: SkeletonGraph, assigned: Map<HumanoidBone, Assign>, warnings: string[]): void {
-  let changed = true;
-  let guard = 0;
-  while (changed && guard++ < 8) {
-    changed = false;
-    for (const role of HUMANOID_BONES) {
-      const a = assigned.get(role);
-      if (!a || role === 'hips') continue;
-      let p = HUMANOID_PARENT[role];
-      while (p && !assigned.has(p)) p = HUMANOID_PARENT[p];
-      if (!p) continue;
-      const pa = assigned.get(p)!;
-      if (pa.index === a.index || !isDescendant(graph, a.index, pa.index)) {
-        // Drop the less confident of the two (never drop the hips).
-        const dropChild = p === 'hips' || pa.conf >= a.conf || isFingerBone(role);
-        const victim = dropChild ? role : p;
-        assigned.delete(victim);
-        warnings.push(`${role} ('${graph.nodes[a.index].name}') is not under ${p} ('${graph.nodes[pa.index].name}'); dropped ${victim}.`);
-        changed = true;
-      }
-    }
-  }
-}
-
-export type { ArmChain, LegChain };

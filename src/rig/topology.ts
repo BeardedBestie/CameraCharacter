@@ -1,706 +1,1096 @@
 /**
- * Topology detector: finds the humanoid structure of a {@link SkeletonGraph}
- * from rest positions and hierarchy alone (docs/DESIGN.md §5.4, "Topology
- * detector"). Names are consulted only to exclude helper bones, to collapse
- * Rigify-style continuation segments and, as a fallback, to orient the rig.
+ * Topology detector (docs/DESIGN.md §5.4): finds the humanoid structure of a
+ * bind-pose {@link SkeletonGraph} with an extremity-path search, assigns roles
+ * by chain order and takes the sides + facing decision.
+ *
+ * Names are consulted only through {@link classifyBone}: helper classification
+ * (markers, ignore class, twist/segment merges), class constraints on chain
+ * membership, the shoulder-vs-upperArm rule, finger digits and the sided-name
+ * facing rule.
  *
  * Pure: three.js math classes only.
  */
-import { Vector3 } from 'three';
-import type { Vec3Tuple } from '../core/types';
-import { isHelperBone, isSegmentOf, isTailMarker, normalizeBoneName } from './boneNames';
-import { graphExtent, type SkeletonGraph } from './skeletonGraph';
+import { Matrix4, Quaternion, Vector3 } from 'three';
+import type { HumanoidBone, RigAxes, Vec3Tuple } from '../core/types';
+import {
+  CLAVICLE_TOKENS,
+  HEAD_TOKENS,
+  METACARPAL_TOKENS,
+  TOE_TOKENS,
+  UPPER_ARM_TOKENS,
+  classifyBone,
+  isSegmentOf,
+  type BoneNameInfo,
+  type FingerDigit,
+} from './boneNames';
+import { lca, pathDown, type SkeletonGraph } from './skeletonGraph';
+
+export type NodeKind = 'link' | 'passthrough' | 'marker';
+export type LimbSide = 'left' | 'right';
 
 export interface FingerChain {
-  finger: 'Thumb' | 'Index' | 'Middle' | 'Ring' | 'Little';
-  /** Node indices from the finger root outward (tail markers excluded). */
+  digit: FingerDigit;
+  /** Chain links from the hand outward (metacarpal/tip links included). */
   links: number[];
+  /** Role links: index -> role suffix (`Metacarpal`, `Proximal`, `Intermediate`, `Distal`). */
+  roles: { index: number; segment: 'Metacarpal' | 'Proximal' | 'Intermediate' | 'Distal' }[];
+  /** Whether the digit came from names or from rest positions. */
+  digitSource: 'name' | 'position';
 }
 
 export interface ArmChain {
+  side: LimbSide;
+  /** Extremity leaf used to find the chain (a fingertip, the hand, ...). */
+  end: number;
+  /** Chain links between the spine branch (exclusive) and the hand (inclusive). */
+  links: number[];
+  /** Path nodes skipped as unmapped intermediates. */
+  intermediates: number[];
   shoulder?: number;
-  upperArm: number;
+  upperArm?: number;
   lowerArm?: number;
   hand?: number;
   fingers: FingerChain[];
-  /** Full walked chain (after helper/segment removal), for diagnostics. */
-  chain: number[];
 }
 
 export interface LegChain {
-  upperLeg: number;
+  side: LimbSide;
+  end: number;
+  links: number[];
+  intermediates: number[];
+  upperLeg?: number;
   lowerLeg?: number;
   foot?: number;
   toes?: number;
-  chain: number[];
-}
-
-export interface RigAxes {
-  up: Vec3Tuple;
-  forward: Vec3Tuple;
 }
 
 export interface TopologyResult {
-  hips?: number;
-  /** From the hips upward, excluding the hips, ending at the arm branch node. */
-  spineChain: number[];
-  neck?: number;
-  head?: number;
-  /** Nodes of the head chain from the branch node upward (neck..head). */
+  hips: number;
+  spineBranch: number;
+  headLeaf: number;
+  /** Torso links from the hips (exclusive) to the spine branch (inclusive). */
+  torso: number[];
+  torsoIntermediates: number[];
+  /** Head chain links from the spine branch (exclusive) to the head. */
   headChain: number[];
-  arms: { left?: ArmChain; right?: ArmChain };
-  legs: { left?: LegChain; right?: LegChain };
+  headIntermediates: number[];
+  arms: { left: ArmChain | null; right: ArmChain | null };
+  legs: { left: LegChain | null; right: LegChain | null };
+  /** Chain-order role of every mapped node. */
+  roles: Map<number, HumanoidBone>;
+  /** Whether the name class agreed with the chain role (for confidence). */
+  nameAgrees: Map<number, boolean>;
   axes: RigAxes;
-  /** Which cue decided the forward axis. */
-  forwardSource: 'toes' | 'foot' | 'names' | 'head' | 'default' | 'override';
+  /** Unit vector toward the rig's left side (loader space). */
+  left: Vec3Tuple;
+  /** Skeleton extent along the up axis (links and markers), loader units. */
+  height: number;
+  sideSource: 'names' | 'geometry';
+  info: BoneNameInfo[];
+  kinds: NodeKind[];
+  /** Marker children per node. */
+  markers: number[][];
   warnings: string[];
 }
 
 export interface TopologyOptions {
-  /** Force the forward axis (used when reconciling with name sides). */
-  forward?: Vec3Tuple;
-  /** Force the up axis. */
-  up?: Vec3Tuple;
+  /** VRM: axes are known (+Y up, +Z forward) and the facing detector is skipped. */
+  vrm?: boolean;
 }
-
-const PRINCIPAL: Vec3Tuple[] = [
-  [1, 0, 0],
-  [-1, 0, 0],
-  [0, 1, 0],
-  [0, -1, 0],
-  [0, 0, 1],
-  [0, 0, -1],
-];
 
 const v3 = (t: Vec3Tuple) => new Vector3(t[0], t[1], t[2]);
 const tup = (v: Vector3): Vec3Tuple => [v.x, v.y, v.z];
 
+const AXES: Vector3[] = [new Vector3(1, 0, 0), new Vector3(0, 1, 0), new Vector3(0, 0, 1)];
+
 /** Snap a direction to the nearest principal axis when within `maxDeg`, else return it normalized. */
 export function snapToAxis(dir: Vector3, maxDeg = 35): { axis: Vector3; snapped: boolean } {
   const d = dir.clone().normalize();
-  let best = PRINCIPAL[2];
+  let best = new Vector3(0, 1, 0);
   let bestDot = -Infinity;
-  for (const p of PRINCIPAL) {
-    const dot = d.x * p[0] + d.y * p[1] + d.z * p[2];
-    if (dot > bestDot) {
-      bestDot = dot;
-      best = p;
+  for (const a of AXES) {
+    for (const s of [1, -1]) {
+      const dot = d.dot(a) * s;
+      if (dot > bestDot) {
+        bestDot = dot;
+        best = a.clone().multiplyScalar(s);
+      }
     }
   }
-  if (bestDot >= Math.cos((maxDeg * Math.PI) / 180)) return { axis: v3(best), snapped: true };
+  if (bestDot >= Math.cos((maxDeg * Math.PI) / 180)) return { axis: best, snapped: true };
   return { axis: d, snapped: false };
 }
 
+// ---------------------------------------------------------------------------
+// Working context
+// ---------------------------------------------------------------------------
+
 class Ctx {
   pos: Vector3[];
-  helper: boolean[];
-  tail: boolean[];
+  info: BoneNameInfo[];
+  kinds: NodeKind[];
+  effParent: number[];
   effChildren: number[][];
-  depth: number[];
-  extent: number;
+  markers: number[][];
+  hasWeights: boolean;
+
   constructor(public g: SkeletonGraph) {
-    this.pos = g.nodes.map((n) => v3(n.restPos));
-    this.helper = g.nodes.map((n) => isHelperBone(n.name));
-    this.tail = g.nodes.map((n) => isTailMarker(n.name));
-    this.extent = graphExtent(g) || 1;
-    this.effChildren = g.nodes.map((n) => this.collectEffective(n.children));
-    this.depth = g.nodes.map((_, i) => this.effDepth(i));
-  }
-  /**
-   * Chain children: tail markers dropped, helper bones (twist, IK, hair...)
-   * skipped but passed through so a chain like Daz `lThighBend → lThighTwist →
-   * lShin` still connects thigh and shin.
-   */
-  private collectEffective(children: number[], depthGuard = 0): number[] {
-    const out: number[] = [];
-    for (const c of children) {
-      if (this.tail[c]) continue;
-      if (this.helper[c]) {
-        if (depthGuard < 8) for (const gc of this.collectEffective(this.g.nodes[c].children, depthGuard + 1)) out.push(gc);
-        continue;
+    const n = g.nodes.length;
+    this.pos = g.nodes.map((nd) => v3(nd.restPos));
+    this.hasWeights = g.hasSkinWeights;
+    this.info = g.nodes.map((nd) => classifyBone(nd.name, { isLeaf: nd.children.length === 0, weight: nd.weight, hasWeights: g.hasSkinWeights }));
+    this.kinds = new Array<NodeKind>(n).fill('link');
+    this.effParent = new Array<number>(n).fill(-1);
+    this.effChildren = g.nodes.map(() => []);
+    this.markers = g.nodes.map(() => []);
+
+    // Parent-first order (BFS from the roots) so a merge can look at the parent link.
+    const order: number[] = [];
+    const queue = [...g.roots];
+    while (queue.length) {
+      const i = queue.shift()!;
+      order.push(i);
+      for (const c of g.nodes[i].children) queue.push(c);
+    }
+    // Full Rigify exports carry DEF- (weighted) plus ORG-/MCH-/control duplicates: only DEF- is eligible.
+    const defOnly = g.nodes.some((nd) => nd.name.startsWith('DEF-'));
+    const hasJoints = g.nodes.some((nd) => nd.isJoint);
+    for (const i of order) {
+      const nd = g.nodes[i];
+      const inf = this.info[i];
+      let kind: NodeKind = 'link';
+      if (inf.group === 'marker') kind = 'marker';
+      else if (inf.group === 'ignore') kind = 'passthrough';
+      else if (hasJoints && !nd.isJoint) kind = 'passthrough';
+      else if (defOnly && !nd.name.startsWith('DEF-')) kind = 'passthrough';
+      // Effective parent: nearest link ancestor.
+      let p = nd.parent;
+      while (p >= 0 && this.kinds[p] !== 'link') p = g.nodes[p].parent;
+      if (kind === 'link' && p >= 0 && isSegmentOf(inf, this.info[p])) kind = 'passthrough';
+      this.kinds[i] = kind;
+      this.effParent[i] = p;
+      if (p >= 0) {
+        if (kind === 'link') this.effChildren[p].push(i);
+        else if (kind === 'marker') this.markers[p].push(i);
       }
-      out.push(c);
+    }
+  }
+  isLink(i: number): boolean {
+    return this.kinds[i] === 'link';
+  }
+  /** Leaves of the reduced tree. */
+  leaves(): number[] {
+    const out: number[] = [];
+    for (let i = 0; i < this.g.nodes.length; i++) if (this.isLink(i) && this.effChildren[i].length === 0) out.push(i);
+    return out;
+  }
+  /** Links and total length from `leaf` up to (and including the link into) the first branching ancestor or the root. */
+  leafChain(leaf: number): { links: number; length: number; top: number } {
+    let links = 0;
+    let length = 0;
+    let cur = leaf;
+    let p = this.effParent[cur];
+    while (p >= 0) {
+      links++;
+      length += this.pos[cur].distanceTo(this.pos[p]);
+      cur = p;
+      if (this.effChildren[cur].length >= 2) break;
+      p = this.effParent[cur];
+    }
+    return { links, length, top: cur };
+  }
+  /** Reduced-tree ancestors of `i` (effective parents upward). */
+  effAncestors(i: number): number[] {
+    const out: number[] = [];
+    let p = this.effParent[i];
+    while (p >= 0) {
+      out.push(p);
+      p = this.effParent[p];
     }
     return out;
   }
-  private effDepth(i: number): number {
-    let best = 0;
-    for (const c of this.effChildren[i]) best = Math.max(best, 1 + this.effDepth(c));
-    return best;
-  }
-  /** Children that continue a chain: helpers, tail markers and zero-length duplicates skipped. */
-  chainChildren(i: number): number[] {
-    return this.effChildren[i];
-  }
-  link(a: number, b: number): Vector3 {
-    return this.pos[b].clone().sub(this.pos[a]);
-  }
-  mainChild(i: number): number {
-    let best = -1;
-    let bestDepth = -1;
-    let bestLen = -1;
-    for (const c of this.effChildren[i]) {
-      const d = this.depth[c];
-      const len = this.link(i, c).length();
-      if (d > bestDepth || (d === bestDepth && len > bestLen)) {
-        best = c;
-        bestDepth = d;
-        bestLen = len;
-      }
+  /** Any ancestor (full tree) of `i` is in `set`. */
+  underAny(i: number, set: ReadonlySet<number>): boolean {
+    let p = this.g.nodes[i].parent;
+    while (p >= 0) {
+      if (set.has(p)) return true;
+      p = this.g.nodes[p].parent;
     }
-    return best;
-  }
-  /**
-   * Walks a limb chain from `start`, collapsing continuation segments and
-   * zero-length links, stopping at the end-effector (leaf or finger branch).
-   */
-  walkLimb(start: number, maxLinks = 8): number[] {
-    const chain: number[] = [start];
-    let cur = start;
-    let guard = 0;
-    while (guard++ < 64) {
-      const kids = this.effChildren[cur];
-      if (kids.length === 0) break;
-      let next: number;
-      if (kids.length === 1) next = kids[0];
-      else if (kids.length >= 3) break; // fingers / toes: end effector
-      else {
-        const [a, b] = kids;
-        const da = this.depth[a];
-        const db = this.depth[b];
-        if (Math.min(da, db) >= 1 && Math.abs(da - db) <= 1) break; // two finger chains
-        next = this.mainChild(cur);
-      }
-      const nameNext = this.g.nodes[next].name;
-      const nameCur = this.g.nodes[cur].name;
-      const len = this.link(cur, next).length();
-      const segment = isSegmentOf(nameNext, nameCur) || len < 0.005 * this.extent;
-      if (!segment) {
-        chain.push(next);
-        if (chain.length > maxLinks) break;
-      }
-      cur = next;
-    }
-    return chain;
-  }
-  lowest(i: number, up: Vector3): number {
-    let m = this.pos[i].dot(up);
-    for (const c of this.g.nodes[i].children) m = Math.min(m, this.lowest(c, up));
-    return m;
-  }
-  minAlong(up: Vector3): number {
-    let m = Infinity;
-    for (const p of this.pos) m = Math.min(m, p.dot(up));
-    return m;
+    return false;
   }
 }
 
-interface Pair {
-  a: number;
-  b: number;
-  /** Pass-through node between `at` and the pair (e.g. pelvis), or -1. */
-  via: number;
-  score: number;
-  latA: Vector3;
-  latB: Vector3;
+// ---------------------------------------------------------------------------
+// Axes
+// ---------------------------------------------------------------------------
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const s = [...values].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : 0.5 * (s[m - 1] + s[m]);
 }
 
-/**
- * Finds the best mirrored pair of chains hanging from `at` (children or
- * grandchildren through a single pass-through node). `accept` filters chain
- * roots by their walked chain; `weight` scores a single chain.
- */
-function findMirroredPair(
-  ctx: Ctx,
-  at: number,
-  up: Vector3,
-  accept: (root: number, chain: number[]) => boolean,
-  weight: (root: number, chain: number[]) => number,
-): Pair | null {
-  const roots: { root: number; via: number; chain: number[]; lat: Vector3; w: number }[] = [];
-  const consider = (root: number, via: number) => {
-    const chain = ctx.walkLimb(root, 5);
-    if (chain.length < 2 || !accept(root, chain)) return;
-    const ref = chain[Math.min(1, chain.length - 1)];
-    const off = ctx.pos[ref].clone().sub(ctx.pos[at]);
-    const lat = off.clone().addScaledVector(up, -off.dot(up));
-    if (lat.length() < 0.01 * ctx.extent) return;
-    roots.push({ root, via, chain, lat, w: weight(root, chain) });
-  };
-  for (const c of ctx.effChildren[at]) {
-    consider(c, -1);
-    for (const gc of ctx.effChildren[c]) consider(gc, c);
-  }
-  let best: Pair | null = null;
-  for (let i = 0; i < roots.length; i++) {
-    for (let j = i + 1; j < roots.length; j++) {
-      const A = roots[i];
-      const B = roots[j];
-      if (A.via !== B.via) continue;
-      // Mirror symmetry across a plane containing `up`: equal and opposite
-      // components along the lateral axis, equal components perpendicular to it.
-      const diff = A.lat.clone().sub(B.lat);
-      const dl = diff.length();
-      if (dl < 0.02 * ctx.extent) continue;
-      const axis = diff.clone().multiplyScalar(1 / dl);
-      const xA = A.lat.dot(axis);
-      const xB = B.lat.dot(axis);
-      if (Math.min(Math.abs(xA), Math.abs(xB)) < 0.25 * dl) continue;
-      const pA = A.lat.clone().addScaledVector(axis, -xA);
-      const pB = B.lat.clone().addScaledVector(axis, -xB);
-      const sym = 1 - (Math.abs(Math.abs(xA) - Math.abs(xB)) + pA.sub(pB).length()) / dl;
-      const lenA = ctx.pos[A.chain[A.chain.length - 1]].distanceTo(ctx.pos[A.root]);
-      const lenB = ctx.pos[B.chain[B.chain.length - 1]].distanceTo(ctx.pos[B.root]);
-      const lenSim = 1 - Math.abs(lenA - lenB) / Math.max(lenA, lenB, 1e-6);
-      if (sym < 0.5 || lenSim < 0.5) continue;
-      const score = sym + lenSim + 0.5 * (A.w + B.w) + (A.via < 0 ? 0.2 : 0);
-      if (!best || score > best.score) best = { a: A.root, b: B.root, via: A.via, score, latA: A.lat, latB: B.lat };
+/** Symmetric 3x3 eigenvectors (Jacobi), columns sorted by descending eigenvalue. */
+function eigen3(m: number[][]): Vector3[] {
+  const a = m.map((r) => [...r]);
+  const v = [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+  ];
+  for (let sweep = 0; sweep < 30; sweep++) {
+    let off = 0;
+    for (let p = 0; p < 3; p++) for (let q = p + 1; q < 3; q++) off += a[p][q] * a[p][q];
+    if (off < 1e-18) break;
+    for (let p = 0; p < 3; p++) {
+      for (let q = p + 1; q < 3; q++) {
+        if (Math.abs(a[p][q]) < 1e-15) continue;
+        const theta = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+        const t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+        const c = 1 / Math.sqrt(t * t + 1);
+        const s = t * c;
+        for (let k = 0; k < 3; k++) {
+          const akp = a[k][p];
+          const akq = a[k][q];
+          a[k][p] = c * akp - s * akq;
+          a[k][q] = s * akp + c * akq;
+        }
+        for (let k = 0; k < 3; k++) {
+          const apk = a[p][k];
+          const aqk = a[q][k];
+          a[p][k] = c * apk - s * aqk;
+          a[q][k] = s * apk + c * aqk;
+        }
+        for (let k = 0; k < 3; k++) {
+          const vkp = v[k][p];
+          const vkq = v[k][q];
+          v[k][p] = c * vkp - s * vkq;
+          v[k][q] = s * vkp + c * vkq;
+        }
+      }
     }
   }
-  return best;
+  const order = [0, 1, 2].sort((i, j) => a[j][j] - a[i][i]);
+  return order.map((i) => new Vector3(v[0][i], v[1][i], v[2][i]).normalize());
 }
 
-interface HipsCandidate {
-  node: number;
+interface AxisEstimate {
   up: Vector3;
-  legs: Pair;
-  spine: number;
-  score: number;
-}
-
-function evaluateHips(ctx: Ctx, node: number, up: Vector3, floor: number): HipsCandidate | null {
-  const h = ctx.pos[node].dot(up);
-  const above = h - floor;
-  if (above <= 0.05 * ctx.extent) return null;
-  const legs = findMirroredPair(
-    ctx,
-    node,
-    up,
-    (root, chain) => {
-      const end = ctx.pos[chain[chain.length - 1]];
-      const d = end.clone().sub(ctx.pos[root]);
-      if (d.length() < 0.05 * ctx.extent) return false;
-      if (d.dot(up) / d.length() > -0.5) return false;
-      const low = ctx.lowest(root, up);
-      return (low - floor) / above < 0.45;
-    },
-    (root, chain) => {
-      const low = ctx.lowest(root, up);
-      const reach = 1 - (low - floor) / above;
-      return reach + Math.min(chain.length, 4) / 8;
-    },
-  );
-  if (!legs) return null;
-  // Spine child: another child whose subtree rises above the node and is not a leg / leg pass-through.
-  let spine = -1;
-  let spineSize = -1;
-  for (const c of ctx.effChildren[node]) {
-    if (c === legs.a || c === legs.b || c === legs.via) continue;
-    const size = 1 + countSubtree(ctx.g, c);
-    const top = highest(ctx, c, up);
-    if (top - h < 0.05 * ctx.extent) continue;
-    if (size > spineSize) {
-      spineSize = size;
-      spine = c;
-    }
-  }
-  if (spine < 0) return null;
-  const legLow = Math.min(ctx.lowest(legs.a, up), ctx.lowest(legs.b, up));
-  const reach = 1 - (legLow - floor) / above;
-  const depthBonus = 0.02 * ancestorsCount(ctx.g, node);
-  const score = legs.score + 2 * reach + Math.min(spineSize, 30) / 30 + depthBonus;
-  return { node, up: up.clone(), legs, spine, score };
-}
-
-function countSubtree(g: SkeletonGraph, i: number): number {
-  let n = 0;
-  for (const c of g.nodes[i].children) n += 1 + countSubtree(g, c);
-  return n;
-}
-function highest(ctx: Ctx, i: number, up: Vector3): number {
-  let m = ctx.pos[i].dot(up);
-  for (const c of ctx.g.nodes[i].children) m = Math.max(m, highest(ctx, c, up));
-  return m;
-}
-function ancestorsCount(g: SkeletonGraph, i: number): number {
-  let n = 0;
-  let p = g.nodes[i].parent;
-  while (p >= 0) {
-    n++;
-    p = g.nodes[p].parent;
-  }
-  return n;
-}
-
-function legChainFromWalk(chain: number[]): LegChain {
-  const c = chain.slice(0, 4);
-  return { upperLeg: c[0], lowerLeg: c[1], foot: c[2], toes: c[3], chain };
-}
-
-function armChainFromWalk(ctx: Ctx, chain: number[]): ArmChain {
-  let shoulder: number | undefined;
-  let upperArm: number;
-  let lowerArm: number | undefined;
-  let hand: number | undefined;
-  const k = chain.length;
-  if (k >= 4) {
-    shoulder = chain[k - 4];
-    upperArm = chain[k - 3];
-    lowerArm = chain[k - 2];
-    hand = chain[k - 1];
-  } else if (k === 3) {
-    const l0 = ctx.link(chain[0], chain[1]).length();
-    const l1 = ctx.link(chain[1], chain[2]).length();
-    if (l0 < 0.45 * l1) {
-      shoulder = chain[0];
-      upperArm = chain[1];
-      lowerArm = chain[2];
-    } else {
-      upperArm = chain[0];
-      lowerArm = chain[1];
-      hand = chain[2];
-    }
-  } else if (k === 2) {
-    upperArm = chain[0];
-    lowerArm = chain[1];
-  } else {
-    upperArm = chain[0];
-  }
-  const fingers = hand !== undefined ? findFingers(ctx, hand, lowerArm ?? upperArm) : [];
-  return { shoulder, upperArm, lowerArm, hand, fingers, chain };
+  lateral: Vector3;
+  height: number;
+  warnings: string[];
 }
 
 /**
- * Groups the hand's child chains into up to five fingers ordered thumb..little.
- * The thumb is the chain whose root is closest to the wrist and most displaced
- * from the others; the rest are ordered along the thumb→little axis.
+ * Up axis (unsigned lateral + signed up) from the joint cloud: the lateral
+ * axis is the mirror-symmetry normal (candidates: coordinate axes and PCA
+ * axes), the up axis is the larger extent of the remaining two, and the up
+ * sign points toward the extreme leaf that sits on the mid-plane (the head),
+ * away from the paired extremes (the feet).
  */
-function findFingers(ctx: Ctx, hand: number, forearm: number): FingerChain[] {
-  const roots = ctx.effChildren[hand].filter((c) => ctx.depth[c] >= 1 || ctx.effChildren[hand].length >= 4);
-  if (roots.length < 2) return [];
-  const chains = roots.map((r) => ctx.walkLimb(r, 5));
-  const armDir = ctx.link(forearm, hand).normalize();
-  const handPos = ctx.pos[hand];
-  const mean = new Vector3();
-  for (const r of roots) mean.add(ctx.pos[r]);
-  mean.multiplyScalar(1 / roots.length);
-  // Thumb: closest to the hand root along the arm and farthest from the mean sideways.
-  let thumb = 0;
-  let thumbScore = -Infinity;
-  const along = roots.map((r) => ctx.pos[r].clone().sub(handPos).dot(armDir));
-  const maxAlong = Math.max(...along, 1e-6);
-  for (let i = 0; i < roots.length; i++) {
-    const off = ctx.pos[roots[i]].clone().sub(mean);
-    const lateral = off.addScaledVector(armDir, -off.dot(armDir)).length();
-    const s = lateral / Math.max(ctx.extent * 0.01, 1e-6) + (1 - along[i] / maxAlong) * 2;
-    if (s > thumbScore) {
-      thumbScore = s;
-      thumb = i;
+function estimateAxes(ctx: Ctx, forcedUp: Vector3 | null): AxisEstimate {
+  const warnings: string[] = [];
+  const pts: Vector3[] = [];
+  const idx: number[] = [];
+  for (let i = 0; i < ctx.g.nodes.length; i++) {
+    if (ctx.kinds[i] === 'passthrough') continue;
+    pts.push(ctx.pos[i]);
+    idx.push(i);
+  }
+  if (pts.length < 3) {
+    return { up: forcedUp ?? new Vector3(0, 1, 0), lateral: new Vector3(1, 0, 0), height: 0, warnings };
+  }
+  const c = new Vector3();
+  for (const p of pts) c.add(p);
+  c.multiplyScalar(1 / pts.length);
+  const cov = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  const d = new Vector3();
+  for (const p of pts) {
+    d.subVectors(p, c);
+    const e = [d.x, d.y, d.z];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) cov[i][j] += e[i] * e[j];
+  }
+  const extentAlong = (axis: Vector3): number => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const p of pts) {
+      const h = p.dot(axis);
+      if (h < lo) lo = h;
+      if (h > hi) hi = h;
+    }
+    return hi - lo;
+  };
+  const extent = Math.max(extentAlong(AXES[0]), extentAlong(AXES[1]), extentAlong(AXES[2]), 1e-9);
+
+  // Mirror symmetry score for a candidate normal (mean nearest-neighbour distance of the mirrored cloud).
+  const symmetryError = (n: Vector3): number => {
+    let total = 0;
+    const q = new Vector3();
+    for (const p of pts) {
+      const s = 2 * p.clone().sub(c).dot(n);
+      q.copy(p).addScaledVector(n, -s);
+      let best = Infinity;
+      for (const r of pts) {
+        const dd = q.distanceToSquared(r);
+        if (dd < best) best = dd;
+      }
+      total += Math.sqrt(best);
+    }
+    return total / pts.length / extent;
+  };
+
+  const pca = eigen3(cov);
+  const candidateSets: Vector3[][] = [AXES, pca];
+  let bestLateral: Vector3 | null = null;
+  let bestErr = Infinity;
+  let bestSet = AXES;
+  for (const set of candidateSets) {
+    for (const axis of set) {
+      const err = symmetryError(axis);
+      if (err < bestErr - 1e-9) {
+        bestErr = err;
+        bestLateral = axis.clone();
+        bestSet = set;
+      }
     }
   }
-  const others = roots.map((_, i) => i).filter((i) => i !== thumb);
-  const axis = ctx.pos[roots[thumb]].clone().sub(mean);
-  axis.addScaledVector(armDir, -axis.dot(armDir));
-  if (axis.length() < 1e-9) return [];
-  axis.normalize();
-  others.sort((a, b) => ctx.pos[roots[b]].dot(axis) - ctx.pos[roots[a]].dot(axis));
-  const names: FingerChain['finger'][] = ['Index', 'Middle', 'Ring', 'Little'];
-  const out: FingerChain[] = [{ finger: 'Thumb', links: chains[thumb] }];
-  for (let i = 0; i < Math.min(others.length, 4); i++) out.push({ finger: names[i], links: chains[others[i]] });
+  const lateral = bestLateral ?? new Vector3(1, 0, 0);
+  if (bestErr > 0.08) warnings.push('Topology: the skeleton has no clear left/right symmetry plane; the axes may be unreliable.');
+
+  let up: Vector3;
+  if (forcedUp) {
+    up = forcedUp.clone().normalize();
+  } else {
+    const others = bestSet.filter((a) => Math.abs(a.dot(lateral)) < 0.999);
+    others.sort((a, b) => extentAlong(b) - extentAlong(a));
+    up = others[0].clone();
+    if (bestSet !== AXES) {
+      const snap = snapToAxis(up, 35);
+      if (snap.snapped) up = snap.axis;
+      else warnings.push('Topology: the rig up axis is not aligned with a principal axis; using the estimated axis as-is.');
+    }
+    // Sign: the extreme leaf on the mid-plane is the head; paired, laterally displaced extremes are the feet.
+    const xMid = median(pts.map((p) => p.dot(lateral)));
+    // Link leaves only: markers can be misplaced (a head_end sitting at the floor in one bundled file).
+    const leafIdx = idx.filter((i) => ctx.kinds[i] === 'link' && ctx.effChildren[i].length === 0);
+    const leafPts = leafIdx.length >= 2 ? leafIdx.map((i) => ctx.pos[i]) : pts;
+    let hi = -Infinity;
+    let lo = Infinity;
+    for (const p of leafPts) {
+      const h = p.dot(up);
+      if (h > hi) hi = h;
+      if (h < lo) lo = h;
+    }
+    const band = 0.1 * extent;
+    let topLat = 0;
+    let botLat = 0;
+    let topMin = Infinity;
+    let botMin = Infinity;
+    for (const p of leafPts) {
+      const h = p.dot(up);
+      const lat = Math.abs(p.dot(lateral) - xMid);
+      if (h >= hi - band) {
+        topLat = Math.max(topLat, lat);
+        topMin = Math.min(topMin, lat);
+      }
+      if (h <= lo + band) {
+        botLat = Math.max(botLat, lat);
+        botMin = Math.min(botMin, lat);
+      }
+    }
+    const centered = 0.04 * extent;
+    let flip = false;
+    if (topMin < centered !== botMin < centered) {
+      // The head sits on the mid-plane; the feet come as a laterally displaced pair.
+      flip = botMin < centered;
+    } else if (Math.abs(topLat - botLat) > 0.02 * extent) {
+      // Headless: hands reach further sideways than feet, so the more lateral extremes are up.
+      flip = botLat > topLat;
+    } else {
+      // Tie: more nodes live in the upper half (arms, fingers, head).
+      const mid = 0.5 * (hi + lo);
+      let above = 0;
+      for (const p of pts) if (p.dot(up) > mid) above++;
+      flip = above < pts.length - above;
+    }
+    if (flip) up.negate();
+  }
+  // Keep the lateral axis perpendicular to up.
+  lateral.addScaledVector(up, -lateral.dot(up)).normalize();
+  return { up, lateral, height: extentAlong(up), warnings };
+}
+
+// ---------------------------------------------------------------------------
+// Chains
+// ---------------------------------------------------------------------------
+
+function isChainLinkForLimb(inf: BoneNameInfo, limb: 'arm' | 'leg'): boolean {
+  if (limb === 'arm') return inf.group !== 'torso' && inf.group !== 'leg' && inf.group !== 'face' && inf.group !== 'finger';
+  return inf.group !== 'torso' && inf.group !== 'arm' && inf.group !== 'face' && inf.group !== 'finger';
+}
+
+function fingerRolesFor(ctx: Ctx, digit: FingerDigit, links: number[]): FingerChain['roles'] {
+  let usable = links.filter((i) => {
+    const inf = ctx.info[i];
+    if (inf.finger?.segment === 'Tip') return false;
+    if (digit !== 'Thumb' && (inf.finger?.segment === 'Metacarpal' || (inf.keyword !== null && METACARPAL_TOKENS.has(inf.keyword)))) return false;
+    return true;
+  });
+  if (digit !== 'Thumb' && usable.length >= 4) usable = usable.slice(usable.length - 3);
+  if (digit === 'Thumb' && usable.length > 3) usable = usable.slice(0, 3);
+  const roles: FingerChain['roles'] = [];
+  const segs: FingerChain['roles'][number]['segment'][] =
+    digit === 'Thumb'
+      ? usable.length >= 3
+        ? ['Metacarpal', 'Proximal', 'Distal']
+        : usable.length === 2
+          ? ['Proximal', 'Distal']
+          : ['Proximal']
+      : usable.length >= 3
+        ? ['Proximal', 'Intermediate', 'Distal']
+        : usable.length === 2
+          ? ['Proximal', 'Intermediate']
+          : ['Proximal'];
+  for (let k = 0; k < usable.length && k < segs.length; k++) roles.push({ index: usable[k], segment: segs[k] });
+  return roles;
+}
+
+const DIGIT_ORDER: FingerDigit[] = ['Thumb', 'Index', 'Middle', 'Ring', 'Little'];
+
+/**
+ * Finger chains under `hand`, ordered thumb -> little. Digits from names when
+ * every chain is consistently named, else from rest positions: the thumb is
+ * the chain root that is most forward and closest to the wrist; the others are
+ * ordered by distance from the thumb across the hand.
+ */
+function findFingers(ctx: Ctx, hand: number, wrist: number, forward: Vector3, height: number): FingerChain[] {
+  const roots = ctx.effChildren[hand].filter((c) => ctx.info[c].group !== 'face');
+  if (roots.length === 0) return [];
+  type Cand = { root: number; links: number[]; digit: FingerDigit | null; length: number };
+  const cands: Cand[] = roots.map((r) => {
+    const links = [r];
+    let cur = r;
+    while (ctx.effChildren[cur].length === 1) {
+      cur = ctx.effChildren[cur][0];
+      links.push(cur);
+    }
+    let digit: FingerDigit | null = null;
+    let consistent = true;
+    for (const l of links) {
+      const f = ctx.info[l].finger;
+      if (!f) continue;
+      if (digit === null) digit = f.digit;
+      else if (digit !== f.digit) consistent = false;
+    }
+    let length = 0;
+    for (let k = 1; k < links.length; k++) length += ctx.pos[links[k]].distanceTo(ctx.pos[links[k - 1]]);
+    return { root: r, links, digit: consistent ? digit : null, length };
+  });
+  // Keep at most five chains: named digits first, then the longest.
+  cands.sort((a, b) => Number(b.digit !== null) - Number(a.digit !== null) || b.length - a.length);
+  const kept = cands.slice(0, 5);
+  const allNamed = kept.every((c) => c.digit !== null) && new Set(kept.map((c) => c.digit)).size === kept.length;
+  const out: FingerChain[] = [];
+  if (allNamed) {
+    kept.sort((a, b) => DIGIT_ORDER.indexOf(a.digit!) - DIGIT_ORDER.indexOf(b.digit!));
+    for (const c of kept) out.push({ digit: c.digit!, links: c.links, roles: fingerRolesFor(ctx, c.digit!, c.links), digitSource: 'name' });
+    return out;
+  }
+  // Position-based ordering.
+  const wristPos = ctx.pos[wrist];
+  const handPos = ctx.pos[hand];
+  const scale = Math.max(height, 1e-6);
+  let thumb = 0;
+  let best = -Infinity;
+  kept.forEach((c, k) => {
+    const rp = ctx.pos[c.root];
+    const forwardness = rp.clone().sub(handPos).dot(forward) / scale;
+    const closeness = -rp.distanceTo(wristPos) / scale;
+    const s = forwardness + closeness;
+    if (s > best) {
+      best = s;
+      thumb = k;
+    }
+  });
+  const thumbPos = ctx.pos[kept[thumb].root];
+  const others = kept.filter((_, k) => k !== thumb);
+  others.sort((a, b) => ctx.pos[a.root].distanceTo(thumbPos) - ctx.pos[b.root].distanceTo(thumbPos));
+  const ordered = [kept[thumb], ...others];
+  ordered.forEach((c, k) => {
+    if (k >= DIGIT_ORDER.length) return;
+    const digit = DIGIT_ORDER[k];
+    out.push({ digit, links: c.links, roles: fingerRolesFor(ctx, digit, c.links), digitSource: 'position' });
+  });
   return out;
 }
 
+interface WalkResult {
+  links: number[];
+  intermediates: number[];
+}
+
+/** Path links after class constraints, leading displacement rule and near-zero merges. */
+function walkLimb(ctx: Ctx, start: number, end: number, limb: 'arm' | 'leg', height: number): WalkResult {
+  const path = pathDown(ctx.g, start, end);
+  const links: number[] = [];
+  const intermediates: number[] = [];
+  const startPos = ctx.pos[start];
+  for (const i of path) {
+    if (!ctx.isLink(i)) {
+      if (ctx.kinds[i] === 'passthrough') intermediates.push(i);
+      continue;
+    }
+    const inf = ctx.info[i];
+    if (!isChainLinkForLimb(inf, limb)) {
+      intermediates.push(i);
+      continue;
+    }
+    if (links.length === 0) {
+      // Leading intermediates: nodes that do not displace from the chain start (Genesis pelvis).
+      if (limb === 'leg' && ctx.pos[i].distanceTo(startPos) < 0.05 * height) {
+        intermediates.push(i);
+        continue;
+      }
+    } else {
+      const prev = links[links.length - 1];
+      if (ctx.pos[i].distanceTo(ctx.pos[prev]) < 0.02 * height) {
+        intermediates.push(i);
+        continue;
+      }
+    }
+    links.push(i);
+  }
+  return { links, intermediates };
+}
+
+function buildLeg(ctx: Ctx, hips: number, end: number, height: number, side: LimbSide): LegChain {
+  const { links, intermediates } = walkLimb(ctx, hips, end, 'leg', height);
+  const leg: LegChain = { side, end, links, intermediates: [...intermediates] };
+  if (links.length >= 1) leg.upperLeg = links[0];
+  if (links.length >= 2) leg.lowerLeg = links[1];
+  if (links.length >= 3) leg.foot = links[2];
+  if (links.length >= 4) {
+    const rest = links.slice(3);
+    const named = rest.find((i) => ctx.info[i].keyword !== null && TOE_TOKENS.has(ctx.info[i].keyword!));
+    leg.toes = named ?? rest[rest.length - 1];
+    for (const i of rest) if (i !== leg.toes) leg.intermediates.push(i);
+  }
+  return leg;
+}
+
+function buildArm(ctx: Ctx, branch: number, end: number, height: number, side: LimbSide, forward: Vector3): ArmChain {
+  const path = pathDown(ctx.g, branch, end);
+  // Hand cut: deepest branching link that is not a finger; else the last non-finger link.
+  let hand = -1;
+  for (const i of path) {
+    if (!ctx.isLink(i)) continue;
+    if (ctx.info[i].group === 'finger') break;
+    if (ctx.effChildren[i].length >= 2) hand = i;
+  }
+  if (hand < 0) {
+    for (const i of path) {
+      if (!ctx.isLink(i)) continue;
+      if (ctx.info[i].group === 'finger') break;
+      hand = i;
+    }
+  }
+  if (hand < 0) hand = end;
+  const { links, intermediates } = walkLimb(ctx, branch, hand, 'arm', height);
+  const arm: ArmChain = { side, end, links, intermediates, fingers: [] };
+  const n = links.length;
+  const kw = (i: number) => ctx.info[i].keyword;
+  const firstIsShoulder = (): boolean => {
+    const k0 = kw(links[0]);
+    if (n >= 4) return true;
+    if (k0 !== null && CLAVICLE_TOKENS.has(k0)) return true;
+    if (k0 === 'shoulder' && n >= 2) {
+      const k1 = kw(links[1]);
+      if (k1 !== null && UPPER_ARM_TOKENS.has(k1)) return true;
+    }
+    return false;
+  };
+  if (n >= 4) {
+    arm.shoulder = links[0];
+    arm.upperArm = links[n - 3];
+    arm.lowerArm = links[n - 2];
+    arm.hand = links[n - 1];
+    for (let k = 1; k < n - 3; k++) arm.intermediates.push(links[k]);
+  } else if (n === 3) {
+    if (firstIsShoulder()) {
+      arm.shoulder = links[0];
+      arm.upperArm = links[1];
+      arm.lowerArm = links[2];
+    } else {
+      arm.upperArm = links[0];
+      arm.lowerArm = links[1];
+      arm.hand = links[2];
+    }
+  } else if (n === 2) {
+    if (firstIsShoulder()) {
+      arm.shoulder = links[0];
+      arm.upperArm = links[1];
+    } else {
+      arm.upperArm = links[0];
+      arm.lowerArm = links[1];
+    }
+  } else if (n === 1) {
+    arm.upperArm = links[0];
+  }
+  if (arm.hand !== undefined) arm.fingers = findFingers(ctx, arm.hand, arm.lowerArm ?? arm.upperArm ?? arm.hand, forward, height);
+  return arm;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+function emptyResult(ctx: Ctx | null, warnings: string[]): TopologyResult {
+  return {
+    hips: -1,
+    spineBranch: -1,
+    headLeaf: -1,
+    torso: [],
+    torsoIntermediates: [],
+    headChain: [],
+    headIntermediates: [],
+    arms: { left: null, right: null },
+    legs: { left: null, right: null },
+    roles: new Map(),
+    nameAgrees: new Map(),
+    axes: { up: [0, 1, 0], forward: [0, 0, 1], facingSource: 'assumed' },
+    left: [1, 0, 0],
+    height: 0,
+    sideSource: 'geometry',
+    info: ctx ? ctx.info : [],
+    kinds: ctx ? ctx.kinds : [],
+    markers: ctx ? ctx.markers : [],
+    warnings,
+  };
+}
+
 /**
- * Detects hips, spine chain, head chain, arm and leg chains and the rig axes
- * from the graph's rest pose.
+ * Detects hips, torso chain, head chain, arm and leg chains, the rig axes and
+ * the sides from the graph's bind pose (docs/DESIGN.md §5.4).
  */
 export function analyzeTopology(graph: SkeletonGraph, opts: TopologyOptions = {}): TopologyResult {
   const warnings: string[] = [];
-  const result: TopologyResult = {
-    spineChain: [],
-    headChain: [],
-    arms: {},
-    legs: {},
-    axes: { up: [0, 1, 0], forward: [0, 0, 1] },
-    forwardSource: 'default',
-    warnings,
-  };
   if (graph.nodes.length < 3) {
     warnings.push('Topology: too few nodes to analyze.');
-    return result;
+    return emptyResult(null, warnings);
   }
   const ctx = new Ctx(graph);
+  const est = estimateAxes(ctx, opts.vrm ? new Vector3(0, 1, 0) : null);
+  for (const w of est.warnings) warnings.push(w);
+  const up = est.up;
+  const lateral = est.lateral;
+  const height = est.height > 0 ? est.height : Math.max(1e-6, 1);
+  const h = (i: number) => ctx.pos[i].dot(up);
+  const allLinkPts = ctx.pos.filter((_, i) => ctx.isLink(i));
+  const xMid = median(allLinkPts.map((p) => p.dot(lateral)));
+  const x = (i: number) => ctx.pos[i].dot(lateral) - xMid;
 
-  // 1. Hips: try every principal axis as "up" unless one is forced.
-  const upCandidates = opts.up ? [v3(opts.up).normalize()] : PRINCIPAL.map(v3);
-  let best: HipsCandidate | null = null;
-  for (const up of upCandidates) {
-    const floor = ctx.minAlong(up);
-    for (let i = 0; i < graph.nodes.length; i++) {
-      if (ctx.helper[i] || ctx.tail[i]) continue;
-      const cand = evaluateHips(ctx, i, up, floor);
-      if (cand && (!best || cand.score > best.score)) best = cand;
-    }
-  }
-  if (!best) {
-    warnings.push('Topology: no node with two mirrored downward leg chains and an upward spine chain was found.');
-    return result;
-  }
-  const hips = best.node;
-  result.hips = hips;
-  let up = best.up.clone();
+  const result = emptyResult(ctx, warnings);
+  result.height = height;
 
-  // 2. Spine chain up to the arm branch node.
-  const spineChain: number[] = [];
-  let cur = best.spine;
-  let armPair: Pair | null = null;
-  let guard = 0;
-  while (cur >= 0 && guard++ < 32) {
-    spineChain.push(cur);
-    armPair = findMirroredPair(
-      ctx,
-      cur,
-      up,
-      (root, chain) => {
-        const d = ctx.link(root, chain[Math.min(chain.length - 1, 2)]);
-        const lat = d.clone().addScaledVector(up, -d.dot(up));
-        return lat.length() > 0.3 * d.length() && ctx.pos[root].dot(up) > ctx.pos[hips].dot(up);
-      },
-      (_root, chain) => Math.min(chain.length, 4) / 4,
-    );
-    if (armPair) {
-      // Arms reached through a pass-through node: that node is the real branch.
-      if (armPair.via >= 0) spineChain.push(armPair.via);
-      break;
-    }
-    cur = ctx.mainChild(cur);
-  }
-  result.spineChain = spineChain;
-  const branch = spineChain[spineChain.length - 1];
-  if (!armPair) warnings.push('Topology: no arm branch found along the spine; arms are unmapped.');
-
-  // 3. Head chain from the branch node.
+  // ---------------------------------------------------------------- feet
+  const leaves = ctx.leaves();
+  const footCands = leaves.filter((l) => {
+    const lc = ctx.leafChain(l);
+    return lc.links >= 2 && lc.length >= 0.25 * height;
+  });
+  footCands.sort((a, b) => h(a) - h(b));
+  let footA = -1;
+  let footB = -1;
   {
-    const exclude = new Set<number>();
-    if (armPair) {
-      exclude.add(armPair.a);
-      exclude.add(armPair.b);
-      if (armPair.via >= 0) exclude.add(armPair.via);
-    }
-    let headRoot = -1;
-    let headScore = -Infinity;
-    for (const c of ctx.effChildren[branch]) {
-      if (exclude.has(c)) continue;
-      const d = ctx.link(branch, c);
-      const upness = d.length() > 1e-9 ? d.dot(up) / d.length() : 0;
-      const top = highest(ctx, c, up) - ctx.pos[branch].dot(up);
-      const s = upness + top / ctx.extent + ctx.depth[c] * 0.05;
-      if (upness > 0.2 && s > headScore) {
-        headScore = s;
-        headRoot = c;
+    type P = { a: number; b: number; top: number };
+    const pairs: P[] = [];
+    for (let i = 0; i < footCands.length; i++) {
+      for (let j = i + 1; j < footCands.length; j++) {
+        const a = footCands[i];
+        const b = footCands[j];
+        if (Math.abs(x(a) + x(b)) >= 0.15 * height) continue;
+        if (Math.abs(x(a) - x(b)) < 0.04 * height) continue;
+        const l = lca(graph, [a, b]);
+        if (l < 0 || l === a || l === b) continue;
+        pairs.push({ a, b, top: Math.max(h(a), h(b)) });
       }
     }
-    if (headRoot >= 0) {
-      const chain = [headRoot];
-      let n = headRoot;
-      let g2 = 0;
-      while (g2++ < 16) {
-        const kids = ctx.effChildren[n];
-        if (kids.length !== 1) break;
-        const d = ctx.link(n, kids[0]);
-        if (d.length() > 1e-9 && d.dot(up) / d.length() < 0.5) break;
-        // An unnamed leaf above a neck+head chain is a tail marker (head_end), not the head.
-        if (ctx.effChildren[kids[0]].length === 0 && chain.length >= 2) break;
-        n = kids[0];
-        chain.push(n);
+    pairs.sort((p, q) => p.top - q.top);
+    if (pairs.length) {
+      footA = pairs[0].a;
+      footB = pairs[0].b;
+    }
+  }
+  if (footA < 0) warnings.push('Topology: no mirrored pair of leg chains found (feet); legs are unmapped.');
+  const legLca = footA >= 0 ? lca(graph, [footA, footB]) : -1;
+  const legPathNodes = new Set<number>();
+  if (legLca >= 0) {
+    for (const f of [footA, footB]) for (const i of pathDown(graph, legLca, f)) legPathNodes.add(i);
+  }
+  const onLeg = (i: number) => legPathNodes.has(i) || ctx.underAny(i, legPathNodes);
+
+  // ---------------------------------------------------------------- hands
+  const handCands = leaves.filter((l) => !onLeg(l) && Math.abs(x(l)) >= 0.1 * height);
+  handCands.sort((a, b) => Math.abs(x(b)) - Math.abs(x(a)));
+  let handA = -1;
+  let handB = -1;
+  outer: for (let i = 0; i < handCands.length; i++) {
+    const a = handCands[i];
+    for (let j = i + 1; j < handCands.length; j++) {
+      const b = handCands[j];
+      if (Math.sign(x(a)) === Math.sign(x(b))) continue;
+      if (Math.abs(x(a) + x(b)) >= 0.15 * height) continue;
+      const l = lca(graph, [a, b]);
+      if (l < 0 || l === a || l === b) continue;
+      if (pathDown(graph, l, a).filter((k) => ctx.isLink(k)).length < 2 || pathDown(graph, l, b).filter((k) => ctx.isLink(k)).length < 2) continue;
+      handA = a;
+      handB = b;
+      break outer;
+    }
+  }
+  if (handA < 0) warnings.push('Topology: no mirrored pair of arm chains found (hands); arms are unmapped.');
+  const armLca = handA >= 0 ? lca(graph, [handA, handB]) : -1;
+  const armPathNodes = new Set<number>();
+  if (armLca >= 0) {
+    for (const hnd of [handA, handB]) for (const i of pathDown(graph, armLca, hnd)) armPathNodes.add(i);
+  }
+  const onArm = (i: number) => armPathNodes.has(i) || ctx.underAny(i, armPathNodes);
+
+  // ---------------------------------------------------------------- head leaf
+  let headLeaf = -1;
+  {
+    const minH = armLca >= 0 ? h(armLca) + 0.05 * height : legLca >= 0 ? h(legLca) : -Infinity;
+    const cands = leaves.filter((l) => !onLeg(l) && !onArm(l) && h(l) > minH);
+    cands.sort((a, b) => h(b) - h(a));
+    if (cands.length) headLeaf = cands[0];
+  }
+  if (headLeaf < 0) warnings.push('Topology: no head chain found above the arm branch.');
+  result.headLeaf = headLeaf;
+
+  // ---------------------------------------------------------------- hips and spine branch
+  const hipsSet = [footA, footB, headLeaf >= 0 ? headLeaf : armLca].filter((i) => i >= 0);
+  let hips = hipsSet.length ? lca(graph, hipsSet) : -1;
+  if (hips >= 0 && !ctx.isLink(hips)) {
+    if (graph.nodes[hips].isJoint || !graph.hasSkinWeights) warnings.push(`Topology: the hips node '${graph.nodes[hips].name}' carries no skin weight.`);
+    else {
+      warnings.push(`Topology: the common ancestor of the legs and the head ('${graph.nodes[hips].name}') is not a skin joint; the rig cannot be driven as a humanoid.`);
+      hips = -1;
+    }
+  }
+  const branchSet = [handA, handB, headLeaf].filter((i) => i >= 0);
+  let spineBranch = branchSet.length ? lca(graph, branchSet) : -1;
+  if (hips >= 0 && spineBranch >= 0 && spineBranch !== hips && pathDown(graph, hips, spineBranch).length === 0) {
+    warnings.push('Topology: the arm branch is not below the hips; torso unmapped.');
+    spineBranch = -1;
+  }
+  result.hips = hips;
+  result.spineBranch = spineBranch;
+  if (hips < 0) {
+    warnings.push('Topology: no hips (common ancestor of both legs and the head) found.');
+  }
+
+  // ---------------------------------------------------------------- sides and facing (one decision)
+  const legA = footA >= 0 && hips >= 0 ? walkLimb(ctx, hips, footA, 'leg', height) : null;
+  const legB = footB >= 0 && hips >= 0 ? walkLimb(ctx, hips, footB, 'leg', height) : null;
+  const armA = handA >= 0 && spineBranch >= 0 ? pathDown(graph, spineBranch, handA).filter((i) => ctx.isLink(i) && ctx.info[i].group !== 'finger') : null;
+  const armB = handB >= 0 && spineBranch >= 0 ? pathDown(graph, spineBranch, handB).filter((i) => ctx.isLink(i) && ctx.info[i].group !== 'finger') : null;
+
+  const chainSide = (links: number[] | null): { side: LimbSide | null; count: number; contradiction: boolean } => {
+    if (!links) return { side: null, count: 0, contradiction: false };
+    let side: LimbSide | null = null;
+    let count = 0;
+    let contradiction = false;
+    for (const i of links) {
+      const s = ctx.info[i].side;
+      if (s !== 'left' && s !== 'right') continue;
+      count++;
+      if (side === null) side = s;
+      else if (side !== s) contradiction = true;
+    }
+    return { side, count, contradiction };
+  };
+  const sLegA = chainSide(legA?.links ?? null);
+  const sLegB = chainSide(legB?.links ?? null);
+  const sArmA = chainSide(armA);
+  const sArmB = chainSide(armB);
+  const sidedCount = sLegA.count + sLegB.count + sArmA.count + sArmB.count;
+  let namesConsistent = sidedCount >= 4 && !sLegA.contradiction && !sLegB.contradiction && !sArmA.contradiction && !sArmB.contradiction;
+  const leftDirFromNames = new Vector3();
+  if (namesConsistent) {
+    const pairs: [{ side: LimbSide | null }, { side: LimbSide | null }, number, number][] = [];
+    if (legA && legB && legA.links.length && legB.links.length) pairs.push([sLegA, sLegB, legA.links[0], legB.links[0]]);
+    if (armA && armB && armA.length && armB.length) pairs.push([sArmA, sArmB, armA[armA.length - 1], armB[armB.length - 1]]);
+    let used = 0;
+    for (const [sa, sb, ia, ib] of pairs) {
+      if (sa.side === null && sb.side === null) continue;
+      if (sa.side !== null && sb.side !== null && sa.side === sb.side) {
+        namesConsistent = false;
+        break;
       }
-      result.headChain = chain;
-      result.head = chain[chain.length - 1];
-      if (chain.length >= 2) result.neck = chain[0];
-    } else {
-      warnings.push('Topology: no upward head chain found at the arm branch node.');
+      const leftIdx = sa.side === 'left' || sb.side === 'right' ? ia : ib;
+      const rightIdx = leftIdx === ia ? ib : ia;
+      const d = ctx.pos[leftIdx].clone().sub(ctx.pos[rightIdx]);
+      d.addScaledVector(up, -d.dot(up));
+      if (d.length() < 0.02 * height) continue;
+      leftDirFromNames.add(d.normalize());
+      used++;
     }
-  }
-
-  // 4. Refine the up axis from hips -> head, snapped to a principal axis.
-  const headTop = result.head ?? branch;
-  const rawUp = ctx.link(hips, headTop);
-  if (rawUp.length() > 1e-6 && !opts.up) {
-    const snap = snapToAxis(rawUp, 35);
-    if (!snap.snapped) warnings.push('Topology: the rig up axis (hips→head) is not aligned with a principal axis; using it as-is.');
-    if (snap.axis.dot(up) > 0.5) up = snap.axis;
-  }
-
-  // 5. Forward axis.
-  const legWalkA = ctx.walkLimb(best.legs.a, 6);
-  const legWalkB = ctx.walkLimb(best.legs.b, 6);
-  const legA = legChainFromWalk(legWalkA);
-  const legB = legChainFromWalk(legWalkB);
-  const armA = armPair ? armChainFromWalk(ctx, ctx.walkLimb(armPair.a, 8)) : undefined;
-  const armB = armPair ? armChainFromWalk(ctx, ctx.walkLimb(armPair.b, 8)) : undefined;
-
-  let forward: Vector3 | null = null;
-  let forwardSource: TopologyResult['forwardSource'] = 'default';
-  const perpUp = (v: Vector3) => v.clone().addScaledVector(up, -v.dot(up));
-
-  if (opts.forward) {
-    forward = perpUp(v3(opts.forward));
-    forwardSource = 'override';
-  }
-  if (!forward) {
-    const acc = new Vector3();
-    for (const leg of [legA, legB]) {
-      if (leg.foot !== undefined && leg.toes !== undefined) acc.add(perpUp(ctx.link(leg.foot, leg.toes)));
-    }
-    if (acc.length() > 0.01 * ctx.extent) {
-      forward = acc;
-      forwardSource = 'toes';
-    }
-  }
-  if (!forward) {
-    const acc = new Vector3();
-    for (const leg of [legA, legB]) {
-      if (leg.foot === undefined) continue;
-      for (const c of graph.nodes[leg.foot].children) acc.add(perpUp(ctx.link(leg.foot, c)));
-    }
-    if (acc.length() > 0.01 * ctx.extent) {
-      forward = acc;
-      forwardSource = 'foot';
-    }
-  }
-  // Name sides: left - right, then forward = cross(left, up).
-  const nameLeftVec = (() => {
-    const acc = new Vector3();
-    let n = 0;
-    const pairs: [number, number][] = [[best.legs.a, best.legs.b]];
-    if (armPair) pairs.push([armPair.a, armPair.b]);
-    for (const [a, b] of pairs) {
-      const sa = normalizeBoneName(graph.nodes[a].name).side;
-      const sb = normalizeBoneName(graph.nodes[b].name).side;
-      if (sa === 'left' && sb === 'right') {
-        acc.add(perpUp(ctx.link(b, a)));
-        n++;
-      } else if (sa === 'right' && sb === 'left') {
-        acc.add(perpUp(ctx.link(a, b)));
-        n++;
+    if (used === 0 || leftDirFromNames.length() < 0.5) namesConsistent = false;
+    // Arms and legs must agree on which x sign is left.
+    if (namesConsistent && pairs.length === 2) {
+      const dirs = pairs.map(([sa, sb, ia, ib]) => {
+        if (sa.side === null && sb.side === null) return null;
+        const leftIdx = sa.side === 'left' || sb.side === 'right' ? ia : ib;
+        const rightIdx = leftIdx === ia ? ib : ia;
+        const d = ctx.pos[leftIdx].clone().sub(ctx.pos[rightIdx]);
+        return d.addScaledVector(up, -d.dot(up)).normalize();
+      });
+      if (dirs[0] && dirs[1] && dirs[0].dot(dirs[1]) < 0) {
+        namesConsistent = false;
+        warnings.push('Topology: the left/right bone names of the arms and the legs contradict each other; sides taken from geometry.');
       }
     }
-    return n > 0 && acc.length() > 1e-6 ? acc.normalize() : null;
+  }
+
+  // Facing cues from geometry.
+  const toesForward = new Vector3();
+  for (const leg of [legA, legB]) {
+    if (!leg || leg.links.length < 4) continue;
+    const foot = leg.links[2];
+    const rest = leg.links.slice(3);
+    const toes = rest.find((i) => ctx.info[i].keyword !== null && TOE_TOKENS.has(ctx.info[i].keyword!)) ?? rest[rest.length - 1];
+    const d = ctx.pos[toes].clone().sub(ctx.pos[foot]);
+    d.addScaledVector(up, -d.dot(up));
+    toesForward.add(d);
+  }
+  const toesUsable = toesForward.length() > 0.02 * height;
+  const frontMarker = ((): Vector3 | null => {
+    if (headLeaf < 0 || spineBranch < 0) return null;
+    const headPath = pathDown(graph, spineBranch, headLeaf).filter((i) => ctx.isLink(i));
+    for (const node of headPath) {
+      for (const c of graph.nodes[node].children) {
+        if (ctx.isLink(c) && headPath.includes(c)) continue;
+        const inf = ctx.info[c];
+        if (inf.tokens.includes('front') || inf.tokens.includes('headfront')) {
+          const d = ctx.pos[c].clone().sub(ctx.pos[node]);
+          d.addScaledVector(up, -d.dot(up));
+          if (d.length() > 0.01 * height) return d.normalize();
+        }
+      }
+    }
+    return null;
   })();
-  if (nameLeftVec) {
-    const fromNames = new Vector3().crossVectors(nameLeftVec, up);
-    if (forward && forwardSource !== 'override') {
-      if (forward.dot(fromNames) < 0) {
-        warnings.push(
-          `Topology: the ${forwardSource} direction says the rig faces the opposite way from what the left/right bone names imply; trusting the names.`,
-        );
-        forward = fromNames;
-        forwardSource = 'names';
-      }
-    } else if (!forward) {
-      forward = fromNames;
-      forwardSource = 'names';
-    }
-  }
-  if (!forward && result.head !== undefined) {
-    const acc = new Vector3();
-    for (const c of graph.nodes[result.head].children) {
-      if (ctx.tail[c]) continue;
-      acc.add(perpUp(ctx.link(result.head, c)));
-    }
-    if (acc.length() > 0.01 * ctx.extent) {
-      forward = acc;
-      forwardSource = 'head';
-    }
-  }
-  if (!forward || forward.length() < 1e-9) {
-    forward = Math.abs(up.y) > 0.7 || Math.abs(up.x) > 0.7 ? new Vector3(0, 0, 1) : new Vector3(0, -1, 0);
-    forward = perpUp(forward);
-    forwardSource = 'default';
-    warnings.push('Topology: could not determine the facing direction (no toes, side names or face bones); assuming the default.');
-  }
-  forward.normalize();
-  if (forwardSource !== 'override') {
-    const snap = snapToAxis(forward, 35);
-    if (snap.snapped) forward = perpUp(snap.axis).normalize();
-  }
-  result.axes = { up: tup(up), forward: tup(forward) };
-  result.forwardSource = forwardSource;
 
-  // 6. Sides: left = up × forward.
-  const left = new Vector3().crossVectors(up, forward).normalize();
-  const sideOf = (root: number, ref: number) => ctx.pos[ref].clone().sub(ctx.pos[root]).dot(left) > 0;
-  const hipsIdx = best.legs.via >= 0 ? best.legs.via : hips;
-  if (sideOf(hipsIdx, legA.upperLeg)) {
-    result.legs.left = legA;
-    result.legs.right = legB;
+  let forward: Vector3;
+  let facingSource: RigAxes['facingSource'];
+  let left: Vector3;
+  let sideSource: TopologyResult['sideSource'] = 'geometry';
+  if (opts.vrm) {
+    forward = new Vector3(0, 0, 1);
+    facingSource = 'vrm';
+    left = new Vector3().crossVectors(up, forward).normalize();
+    if (namesConsistent) sideSource = 'names';
+  } else if (namesConsistent) {
+    left = leftDirFromNames.normalize();
+    forward = new Vector3().crossVectors(left, up).normalize();
+    facingSource = 'names';
+    sideSource = 'names';
+    if (toesUsable && toesForward.dot(forward) < 0) {
+      warnings.push('Topology: the feet point the opposite way from what the left/right bone names imply; trusting the names (use "swap sides" if the model faces backward).');
+    } else if (frontMarker && frontMarker.dot(forward) < 0) {
+      warnings.push('Topology: the head front marker points the opposite way from what the left/right bone names imply; trusting the names.');
+    }
+  } else if (toesUsable) {
+    forward = toesForward.clone().normalize();
+    facingSource = 'toes';
+    left = new Vector3().crossVectors(up, forward).normalize();
+  } else if (frontMarker) {
+    forward = frontMarker.clone();
+    facingSource = 'marker';
+    left = new Vector3().crossVectors(up, forward).normalize();
   } else {
-    result.legs.left = legB;
-    result.legs.right = legA;
+    forward = Math.abs(up.z) > 0.7 ? new Vector3(0, -1, 0) : new Vector3(0, 0, 1);
+    forward.addScaledVector(up, -forward.dot(up)).normalize();
+    facingSource = 'assumed';
+    left = new Vector3().crossVectors(up, forward).normalize();
+    warnings.push(`Topology: facing assumed (${forward.z > 0.5 ? '+Z' : '-Y'}): no sided bone names, toes or front marker found. Use "swap sides" if the model faces backward.`);
   }
-  if (armPair && armA && armB) {
-    const refA = armA.lowerArm ?? armA.upperArm;
-    const at = armPair.via >= 0 ? armPair.via : branch;
-    if (sideOf(at, refA)) {
-      result.arms.left = armA;
-      result.arms.right = armB;
-    } else {
-      result.arms.left = armB;
-      result.arms.right = armA;
+  // Snap the facing to a principal axis when it is close to one (asymmetric rigs give slightly skewed estimates).
+  if (facingSource !== 'vrm') {
+    const snap = snapToAxis(forward, 25);
+    if (snap.snapped) {
+      forward = snap.axis.clone().addScaledVector(up, -snap.axis.dot(up)).normalize();
+      left = new Vector3().crossVectors(up, forward).normalize();
+    }
+  }
+  result.axes = { up: tup(up), forward: tup(forward), facingSource };
+  result.left = tup(left);
+  result.sideSource = sideSource;
+
+  // ---------------------------------------------------------------- assign sides
+  const sideOfLeg = (links: number[] | null, named: { side: LimbSide | null }, end: number): LimbSide => {
+    if (sideSource === 'names' && named.side) return named.side;
+    const ref = links && links.length ? links[0] : end;
+    return ctx.pos[ref].clone().sub(ctx.pos[hips >= 0 ? hips : ref]).dot(left) >= 0 ? 'left' : 'right';
+  };
+  const legs: { left: LegChain | null; right: LegChain | null } = { left: null, right: null };
+  if (hips >= 0 && footA >= 0 && legA && legB) {
+    let sa = sideOfLeg(legA.links, sLegA, footA);
+    let sb = sideOfLeg(legB.links, sLegB, footB);
+    if (sa === sb) {
+      // Geometry tie-break.
+      sa = x(footA) * (left.dot(lateral) >= 0 ? 1 : -1) >= 0 ? 'left' : 'right';
+      sb = sa === 'left' ? 'right' : 'left';
+    }
+    legs[sa] = buildLeg(ctx, hips, footA, height, sa);
+    legs[sb] = buildLeg(ctx, hips, footB, height, sb);
+  }
+  const arms: { left: ArmChain | null; right: ArmChain | null } = { left: null, right: null };
+  if (spineBranch >= 0 && handA >= 0 && armA && armB) {
+    const sideOfArm = (links: number[], named: { side: LimbSide | null }, end: number): LimbSide => {
+      if (sideSource === 'names' && named.side) return named.side;
+      const ref = links.length ? links[links.length - 1] : end;
+      return ctx.pos[ref].clone().sub(ctx.pos[spineBranch]).dot(left) >= 0 ? 'left' : 'right';
+    };
+    let sa = sideOfArm(armA, sArmA, handA);
+    let sb = sideOfArm(armB, sArmB, handB);
+    if (sa === sb) {
+      sa = x(handA) * (left.dot(lateral) >= 0 ? 1 : -1) >= 0 ? 'left' : 'right';
+      sb = sa === 'left' ? 'right' : 'left';
+    }
+    arms[sa] = buildArm(ctx, spineBranch, handA, height, sa, forward);
+    arms[sb] = buildArm(ctx, spineBranch, handB, height, sb, forward);
+  }
+  result.legs = legs;
+  result.arms = arms;
+
+  // ---------------------------------------------------------------- torso chain
+  const roles = result.roles;
+  const agrees = result.nameAgrees;
+  const setRole = (i: number, role: HumanoidBone, agree: boolean) => {
+    roles.set(i, role);
+    agrees.set(i, agree);
+  };
+  if (hips >= 0) setRole(hips, 'hips', ctx.info[hips].group === 'torso');
+  if (hips >= 0 && spineBranch >= 0 && spineBranch !== hips) {
+    const path = pathDown(graph, hips, spineBranch);
+    const links: number[] = [];
+    let prevPos = ctx.pos[hips];
+    for (const i of path) {
+      if (!ctx.isLink(i)) {
+        result.torsoIntermediates.push(i);
+        continue;
+      }
+      const g = ctx.info[i].group;
+      if (g === 'arm' || g === 'leg' || g === 'finger' || g === 'face') {
+        result.torsoIntermediates.push(i);
+        warnings.push(`Topology: '${graph.nodes[i].name}' lies on the torso chain but is named like a ${g} bone; left unmapped.`);
+        continue;
+      }
+      if (ctx.pos[i].distanceTo(prevPos) < 0.02 * height && i !== spineBranch) {
+        result.torsoIntermediates.push(i);
+        continue;
+      }
+      links.push(i);
+      prevPos = ctx.pos[i];
+    }
+    result.torso = links;
+    const n = links.length;
+    if (n >= 1) setRole(links[0], 'spine', ctx.info[links[0]].group === 'torso');
+    if (n >= 2) {
+      const chestIdx = Math.floor(n / 2); // link round(N/2) toward the upper link, 0-based: N=2 -> 2nd, N=3 -> 2nd, N=4 -> 3rd, N=5 -> 3rd
+      setRole(links[chestIdx], 'chest', ctx.info[links[chestIdx]].group === 'torso');
+    }
+    if (n >= 3) setRole(links[n - 1], 'upperChest', ctx.info[links[n - 1]].group === 'torso');
+    for (const i of links) if (!roles.has(i)) result.torsoIntermediates.push(i);
+  } else if (hips >= 0 && spineBranch === hips) {
+    warnings.push('Topology: the arms attach directly to the hips; no spine bone.');
+  }
+
+  // ---------------------------------------------------------------- head chain
+  if (headLeaf >= 0 && (spineBranch >= 0 || hips >= 0)) {
+    const from = spineBranch >= 0 ? spineBranch : hips;
+    const path = pathDown(graph, from, headLeaf);
+    const links: number[] = [];
+    for (const i of path) {
+      if (!ctx.isLink(i)) {
+        result.headIntermediates.push(i);
+        continue;
+      }
+      const g = ctx.info[i].group;
+      if (g === 'face') break;
+      if (g === 'arm' || g === 'leg' || g === 'finger') {
+        result.headIntermediates.push(i);
+        continue;
+      }
+      links.push(i);
+    }
+    if (links.length) {
+      let head = -1;
+      for (const i of links) if (ctx.info[i].group === 'torso' && ctx.info[i].keyword !== null && HEAD_TOKENS.has(ctx.info[i].keyword!)) head = i;
+      if (head < 0) {
+        for (const i of links) if (ctx.effChildren[i].length >= 2) head = i;
+      }
+      if (head < 0) {
+        const last = links[links.length - 1];
+        const lastIsMarkerLike = ctx.effChildren[last].length === 0 && graph.hasSkinWeights && !(graph.nodes[last].weight > 0) && links.length >= 2;
+        head = lastIsMarkerLike ? links[links.length - 2] : last;
+      }
+      const headPos = links.indexOf(head);
+      const chain = links.slice(0, headPos + 1);
+      result.headChain = chain;
+      setRole(head, 'head', ctx.info[head].group === 'torso');
+      if (chain.length >= 2) setRole(chain[0], 'neck', ctx.info[chain[0]].group === 'torso');
+      for (const i of links) if (!roles.has(i)) result.headIntermediates.push(i);
+    }
+  }
+
+  // ---------------------------------------------------------------- limb roles
+  const sideAgrees = (i: number, side: LimbSide, group: 'arm' | 'leg'): boolean => {
+    const inf = ctx.info[i];
+    return inf.group === group && (inf.side === side || inf.side === null);
+  };
+  for (const side of ['left', 'right'] as const) {
+    const leg = legs[side];
+    if (leg) {
+      if (leg.upperLeg !== undefined) setRole(leg.upperLeg, `${side}UpperLeg`, sideAgrees(leg.upperLeg, side, 'leg'));
+      if (leg.lowerLeg !== undefined) setRole(leg.lowerLeg, `${side}LowerLeg`, sideAgrees(leg.lowerLeg, side, 'leg'));
+      if (leg.foot !== undefined) setRole(leg.foot, `${side}Foot`, sideAgrees(leg.foot, side, 'leg'));
+      if (leg.toes !== undefined) setRole(leg.toes, `${side}Toes`, sideAgrees(leg.toes, side, 'leg'));
+    }
+    const arm = arms[side];
+    if (arm) {
+      if (arm.shoulder !== undefined) setRole(arm.shoulder, `${side}Shoulder`, sideAgrees(arm.shoulder, side, 'arm'));
+      if (arm.upperArm !== undefined) setRole(arm.upperArm, `${side}UpperArm`, sideAgrees(arm.upperArm, side, 'arm'));
+      if (arm.lowerArm !== undefined) setRole(arm.lowerArm, `${side}LowerArm`, sideAgrees(arm.lowerArm, side, 'arm'));
+      if (arm.hand !== undefined) setRole(arm.hand, `${side}Hand`, sideAgrees(arm.hand, side, 'arm'));
+      for (const f of arm.fingers) {
+        for (const r of f.roles) setRole(r.index, `${side}${f.digit}${r.segment}` as HumanoidBone, f.digitSource === 'name' && (ctx.info[r.index].side === side || ctx.info[r.index].side === null));
+      }
     }
   }
   return result;
 }
 
 /**
- * Axes from an already-mapped rig: up = hips→head snapped to a principal axis,
- * forward from foot→toes when available, validated against the mapped sides
- * (left must be at up × forward). Used by the rest-pose analysis.
+ * Quaternion mapping the detected `up` to +Y and `forward` to +Z (left = up × forward
+ * ends at +X). Identity for a standard Y-up, +Z-facing rig.
  */
-export function axesFromRoles(
-  pos: { hips?: Vec3Tuple; head?: Vec3Tuple; top?: Vec3Tuple; leftUpperLeg?: Vec3Tuple; rightUpperLeg?: Vec3Tuple; leftUpperArm?: Vec3Tuple; rightUpperArm?: Vec3Tuple; feet?: [Vec3Tuple, Vec3Tuple][] },
-): { axes: RigAxes; warnings: string[]; leftAtPositiveX: boolean } {
-  const warnings: string[] = [];
-  let up = new Vector3(0, 1, 0);
-  if (pos.hips && (pos.head || pos.top)) {
-    const raw = v3(pos.head ?? pos.top!).sub(v3(pos.hips));
-    if (raw.length() > 1e-9) {
-      const snap = snapToAxis(raw, 35);
-      up = snap.axis;
-      if (!snap.snapped) warnings.push('Rig up axis (hips→head) is not aligned with a principal axis; using it as-is.');
-    }
+export function rootCorrectionFromAxes(axes: RigAxes, out = new Quaternion()): Quaternion {
+  const up = new Vector3().fromArray(axes.up).normalize();
+  let fwd = new Vector3().fromArray(axes.forward);
+  fwd.addScaledVector(up, -fwd.dot(up));
+  if (fwd.length() < 1e-6) {
+    fwd = Math.abs(up.z) > 0.7 ? new Vector3(0, -1, 0) : new Vector3(0, 0, 1);
+    fwd.addScaledVector(up, -fwd.dot(up));
   }
-  const perpUp = (v: Vector3) => v.addScaledVector(up, -v.dot(up));
-  let leftVec: Vector3 | null = null;
-  const pairs: [Vec3Tuple | undefined, Vec3Tuple | undefined][] = [
-    [pos.leftUpperLeg, pos.rightUpperLeg],
-    [pos.leftUpperArm, pos.rightUpperArm],
-  ];
-  const acc = new Vector3();
-  for (const [l, r] of pairs) if (l && r) acc.add(perpUp(v3(l).sub(v3(r))));
-  if (acc.length() > 1e-6) leftVec = acc.normalize();
-
-  let forward: Vector3 | null = null;
-  if (pos.feet && pos.feet.length) {
-    const f = new Vector3();
-    for (const [foot, toes] of pos.feet) f.add(perpUp(v3(toes).sub(v3(foot))));
-    if (f.length() > 1e-6) forward = f.normalize();
-  }
-  if (leftVec) {
-    const fromSides = new Vector3().crossVectors(leftVec, up).normalize();
-    if (forward && forward.dot(fromSides) < 0) {
-      warnings.push('Left/right inversion: the feet point the opposite way from what the mapped left/right bones imply; using the mapped sides for the facing.');
-    }
-    forward = fromSides;
-  }
-  if (!forward) {
-    forward = Math.abs(up.y) > 0.7 || Math.abs(up.x) > 0.7 ? new Vector3(0, 0, 1) : new Vector3(0, -1, 0);
-    warnings.push('Could not determine the facing direction from the mapped bones; assuming the default.');
-  }
-  forward = perpUp(forward.clone()).normalize();
-  const snap = snapToAxis(forward, 35);
-  if (snap.snapped) forward = perpUp(snap.axis).normalize();
-  const left = new Vector3().crossVectors(up, forward);
-  const leftAtPositiveX = leftVec ? leftVec.dot(left) > 0 : true;
-  return { axes: { up: tup(up), forward: tup(forward) }, warnings, leftAtPositiveX };
+  fwd.normalize();
+  const left = new Vector3().crossVectors(up, fwd).normalize();
+  const m = new Matrix4().makeBasis(left, up, fwd); // canonical -> rig
+  return out.setFromRotationMatrix(m).invert(); // rig -> canonical
 }

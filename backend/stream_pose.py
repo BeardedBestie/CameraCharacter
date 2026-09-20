@@ -9,8 +9,10 @@ is the UI (Source panel -> WebSocket -> ws://localhost:8765).
     python backend/stream_pose.py --camera 0 --preview
 
 Capture and inference run in a worker thread; encoded frames are handed to the
-asyncio loop with call_soon_threadsafe and broadcast without waiting for slow
-clients (their frames are dropped, never queued up).
+asyncio loop with call_soon_threadsafe and fanned out without ever awaiting a
+client. websockets' broadcast() has no backpressure, so the provider checks each
+client's transport write buffer itself and skips the frame for any client whose
+socket is saturated (frames are dropped for that client, never queued up).
 """
 from __future__ import annotations
 
@@ -38,6 +40,9 @@ PROTOCOL_VERSION = 2
 SOURCE_ID = "python-opencv"
 POSE_LANDMARK_COUNT = 33
 FLOAT_DECIMALS = 5
+# A client whose asyncio transport still holds more than this many unsent bytes
+# (the kernel socket buffer is already full at that point) skips the frame.
+MAX_CLIENT_BACKLOG_BYTES = 16 * 1024
 
 MODEL_VARIANTS = ("lite", "full", "heavy")
 MODEL_URL_TEMPLATE = (
@@ -161,39 +166,81 @@ def detect(landmarker: Any, rgb: np.ndarray, timestamp_ms: int) -> Any:
 # PoseFrame v2 encoding + validation (shared with selftest.py)
 # ---------------------------------------------------------------------------
 
-def _round(value: Optional[float]) -> float:
-    if value is None:
-        return 0.0
-    v = float(value)
-    if not math.isfinite(v):
-        return 0.0
-    r = round(v, FLOAT_DECIMALS)
-    return 0.0 if r == 0 else r  # normalize -0.0
+def _round(value: float) -> float:
+    """Round a finite float to FLOAT_DECIMALS and normalize -0.0 to 0.0."""
+    r = round(float(value), FLOAT_DECIMALS)
+    return 0.0 if r == 0 else r
+
+
+def _finite(value: Any) -> Optional[float]:
+    """float(value) when it is a finite number, else None (None/NaN/inf/non-numeric)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _time(value: float) -> float:
+    """Encode a clock value: ints stay ints on the wire (timestamp_ms is an int), floats are rounded."""
+    if isinstance(value, bool):
+        raise TypeError("clock value must be a number")
+    if isinstance(value, int):
+        return value
+    v = _finite(value)
+    if v is None:
+        raise ValueError(f"clock value must be finite, got {value!r}")
+    return _round(v)
 
 
 def _visibility(lm: Any) -> float:
-    vis = getattr(lm, "visibility", None)
+    """MediaPipe fills `visibility` when the model supports it, else `presence`; absent means 1."""
+    vis = _finite(getattr(lm, "visibility", None))
     if vis is None:
-        vis = getattr(lm, "presence", None)
+        vis = _finite(getattr(lm, "presence", None))
     if vis is None:
         return 1.0
-    v = float(vis)
-    if not math.isfinite(v):
-        return 0.0
-    return _round(min(1.0, max(0.0, v)))
+    return _round(min(1.0, max(0.0, vis)))
+
+
+def encode_landmark(lm: Any) -> list[float]:
+    """
+    Encode one (Normalized)Landmark as [x, y, z, visibility]. A landmark with any non-finite
+    coordinate is emitted as [0, 0, 0, 0]: invisible, so the browser's gate drops it, instead of
+    a fully visible point at the origin.
+    """
+    x = _finite(getattr(lm, "x", None))
+    y = _finite(getattr(lm, "y", None))
+    z = _finite(getattr(lm, "z", None))
+    if x is None or y is None or z is None:
+        return [0.0, 0.0, 0.0, 0.0]
+    return [_round(x), _round(y), _round(z), _visibility(lm)]
 
 
 def encode_landmarks(landmarks: Sequence[Any]) -> list[list[float]]:
     """Encode 33 (Normalized)Landmark objects as [[x, y, z, visibility] * 33]."""
     if len(landmarks) != POSE_LANDMARK_COUNT:
         raise ValueError(f"expected {POSE_LANDMARK_COUNT} landmarks, got {len(landmarks)}")
-    return [[_round(lm.x), _round(lm.y), _round(lm.z), _visibility(lm)] for lm in landmarks]
+    return [encode_landmark(lm) for lm in landmarks]
 
 
-def encode_frame(timestamp_ms: float, size: tuple[int, int], result: Any) -> dict[str, Any]:
+def encode_frame(
+    timestamp_ms: float,
+    size: tuple[int, int],
+    result: Any,
+    *,
+    now_ms: Optional[float] = None,
+) -> dict[str, Any]:
     """
     Build a PoseFrame v2 dict from a PoseLandmarkerResult (or None). Landmarks stay in raw
     MediaPipe conventions; the browser converts. Hands/face are omitted.
+
+    `timestamp_ms` is the frame's media time (the value handed to detect_for_video, an int in
+    production). `now_ms` is the provider's performance counter at capture in ms
+    (time.perf_counter() * 1000); it is emitted as the optional `now` field when given. The
+    browser re-stamps `now` on receipt, so it only documents the provider's own capture clock.
     """
     pose: Optional[dict[str, Any]] = None
     if result is not None:
@@ -201,13 +248,16 @@ def encode_frame(timestamp_ms: float, size: tuple[int, int], result: Any) -> dic
         world_sets = getattr(result, "pose_world_landmarks", None) or []
         if image_sets and world_sets and len(image_sets[0]) == POSE_LANDMARK_COUNT and len(world_sets[0]) == POSE_LANDMARK_COUNT:
             pose = {"world": encode_landmarks(world_sets[0]), "image": encode_landmarks(image_sets[0])}
-    return {
+    frame: dict[str, Any] = {
         "v": PROTOCOL_VERSION,
-        "t": _round(timestamp_ms),
-        "src": SOURCE_ID,
-        "size": [int(size[0]), int(size[1])],
-        "pose": pose,
+        "t": _time(timestamp_ms),
     }
+    if now_ms is not None:
+        frame["now"] = _time(now_ms)
+    frame["src"] = SOURCE_ID
+    frame["size"] = [int(size[0]), int(size[1])]
+    frame["pose"] = pose
+    return frame
 
 
 def frame_to_json(frame: dict[str, Any]) -> str:
@@ -245,6 +295,8 @@ def validate_pose_frame(frame: Any) -> list[str]:
         errors.append(f"v must be {PROTOCOL_VERSION}")
     if not _is_number(frame.get("t")):
         errors.append("t must be a finite number (ms)")
+    if "now" in frame and frame["now"] is not None and not _is_number(frame["now"]):
+        errors.append("now must be a finite number (ms) when present")
     src = frame.get("src")
     if not isinstance(src, str) or not src:
         errors.append("src must be a non-empty string")
@@ -378,61 +430,13 @@ class PoseWorker(threading.Thread):
         import cv2
 
         cap = self._open_capture()
-        landmarker = create_landmarker(self.model_file)
-        window = "CameraCharacter pose (q to quit)"
-        if self.preview:
-            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)  # > 0 only for file inputs
-        t0 = time.monotonic()
-        last_ts = -1
-        min_interval = 1.0 / self.max_fps if self.max_fps > 0 else 0.0
-        last_infer = 0.0
-        read_failures = 0
         try:
-            while not self._stop_event.is_set():
-                ok, bgr = cap.read()
-                if not ok or bgr is None:
-                    if total_frames > 0 and cap.get(cv2.CAP_PROP_POS_FRAMES) >= total_frames:
-                        self.log("[camera] end of input file")
-                        break
-                    read_failures += 1
-                    if read_failures >= 30:
-                        raise RuntimeError("camera stopped delivering frames")
-                    time.sleep(0.02)
-                    continue
-                read_failures = 0
-                now = time.monotonic()
-                if min_interval > 0 and (now - last_infer) < min_interval:
-                    # Throttle inference: keep draining the camera so frames stay fresh.
-                    if self.preview:
-                        if cv2.waitKey(1) & 0xFF == ord("q"):
-                            break
-                    continue
-                last_infer = now
-                # Strictly increasing integer timestamps are required by VIDEO mode.
-                ts = int((now - t0) * 1000.0)
-                if ts <= last_ts:
-                    ts = last_ts + 1
-                last_ts = ts
-                h, w = bgr.shape[:2]
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                result = detect(landmarker, rgb, ts)
-                frame = encode_frame(ts, (w, h), result)
-                self.frames += 1
-                detected = frame["pose"] is not None
-                if detected:
-                    self.detections += 1
-                self.on_frame(frame_to_json(frame), detected)
-                if self.preview:
-                    if frame["pose"] is not None:
-                        draw_skeleton(bgr, frame["pose"]["image"])
-                    if self.mirror_preview:
-                        bgr = cv2.flip(bgr, 1)
-                    cv2.putText(bgr, f"{'pose' if detected else 'no subject'}  t={ts}ms", (10, 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-                    cv2.imshow(window, bgr)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
+            landmarker = create_landmarker(self.model_file)
+        except BaseException:
+            cap.release()
+            raise
+        try:
+            self._loop(cap, landmarker)
         finally:
             cap.release()
             landmarker.close()
@@ -442,18 +446,89 @@ class PoseWorker(threading.Thread):
                 except cv2.error:
                     pass
 
+    def _loop(self, cap: Any, landmarker: Any) -> None:
+        import cv2
+
+        window = "CameraCharacter pose (q to quit)"
+        if self.preview:
+            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)  # > 0 only for file inputs
+        t0 = time.monotonic()
+        last_ts = -1
+        min_interval = 1.0 / self.max_fps if self.max_fps > 0 else 0.0
+        last_infer = 0.0
+        read_failures = 0
+        while not self._stop_event.is_set():
+            ok, bgr = cap.read()
+            if not ok or bgr is None:
+                if total_frames > 0 and cap.get(cv2.CAP_PROP_POS_FRAMES) >= total_frames:
+                    self.log("[camera] end of input file")
+                    break
+                read_failures += 1
+                if read_failures >= 30:
+                    raise RuntimeError("camera stopped delivering frames")
+                time.sleep(0.02)
+                continue
+            read_failures = 0
+            now = time.monotonic()
+            captured_ms = time.perf_counter() * 1000.0  # provider performance counter at capture
+            if min_interval > 0 and (now - last_infer) < min_interval:
+                # Throttle inference: keep draining the camera so frames stay fresh.
+                if self.preview:
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                continue
+            last_infer = now
+            # Strictly increasing integer timestamps are required by VIDEO mode.
+            ts = int((now - t0) * 1000.0)
+            if ts <= last_ts:
+                ts = last_ts + 1
+            last_ts = ts
+            h, w = bgr.shape[:2]
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            result = detect(landmarker, rgb, ts)
+            frame = encode_frame(ts, (w, h), result, now_ms=captured_ms)
+            self.frames += 1
+            detected = frame["pose"] is not None
+            if detected:
+                self.detections += 1
+            self.on_frame(frame_to_json(frame), detected)
+            if self.preview:
+                if frame["pose"] is not None:
+                    draw_skeleton(bgr, frame["pose"]["image"])
+                if self.mirror_preview:
+                    bgr = cv2.flip(bgr, 1)
+                cv2.putText(bgr, f"{'pose' if detected else 'no subject'}  t={ts}ms", (10, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.imshow(window, bgr)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
 
 # ---------------------------------------------------------------------------
 # WebSocket server
 # ---------------------------------------------------------------------------
 
 class Broadcaster:
-    """Tracks connected clients and fans out frames without ever awaiting a slow client."""
+    """
+    Tracks connected clients and fans out frames without ever awaiting a client.
 
-    def __init__(self, log: Callable[[str], None] = print) -> None:
+    websockets.asyncio.server.broadcast() writes synchronously and has no backpressure: a
+    client that reads slower than the frame rate would accumulate an ever-growing write
+    buffer (latency for that client, memory for us). So before each broadcast the clients
+    whose transport still holds more than MAX_CLIENT_BACKLOG_BYTES of unsent data are left
+    out; they miss this frame and catch up with the next one.
+    """
+
+    def __init__(self, log: Callable[[str], None] = print, backlog_limit: int = MAX_CLIENT_BACKLOG_BYTES) -> None:
+        from websockets.asyncio.server import broadcast
+
+        self._broadcast = broadcast
+        self.backlog_limit = backlog_limit
         self.clients: set[Any] = set()
         self.log = log
         self.sent = 0
+        self.dropped = 0
         self.last_message: Optional[str] = None
 
     async def handler(self, connection: Any) -> None:
@@ -472,18 +547,36 @@ class Broadcaster:
             self.clients.discard(connection)
             self.log(f"[ws] client disconnected {peer} ({len(self.clients)} total)")
 
-    def push(self, message: str) -> None:
-        """Called on the event loop thread. Slow clients (full write buffer) skip this frame."""
-        from websockets.asyncio.server import broadcast
+    @staticmethod
+    def backlog_bytes(connection: Any) -> int:
+        """Unsent bytes queued in the client's asyncio transport (0 when unknown)."""
+        transport = getattr(connection, "transport", None)
+        if transport is None:
+            return 0
+        try:
+            return int(transport.get_write_buffer_size())
+        except Exception:  # transport closing or a transport without a write buffer
+            return 0
 
+    def push(self, message: str) -> None:
+        """Called on the event loop thread. Clients whose socket is saturated skip this frame."""
         self.last_message = message
         if not self.clients:
             return
-        broadcast(self.clients, message)
+        ready = [c for c in self.clients if self.backlog_bytes(c) <= self.backlog_limit]
+        self.dropped += len(self.clients) - len(ready)
+        if not ready:
+            return
+        self._broadcast(ready, message)
         self.sent += 1
 
 
 async def serve(args: argparse.Namespace, model_file: str, log: Callable[[str], None] = print) -> int:
+    """
+    Run the WebSocket server and the capture worker until Ctrl-C / SIGTERM, the preview window
+    is closed with q, the input file ends or the worker fails. Returns the process exit code.
+    The worker is always stopped and joined, also when the coroutine is cancelled.
+    """
     from websockets.asyncio.server import serve as ws_serve
 
     loop = asyncio.get_running_loop()
@@ -491,7 +584,14 @@ async def serve(args: argparse.Namespace, model_file: str, log: Callable[[str], 
     stop_event = asyncio.Event()
 
     def on_frame(message: str, _detected: bool) -> None:
-        loop.call_soon_threadsafe(broadcaster.push, message)
+        # Runs on the worker thread. During shutdown the loop may already be closed; a frame
+        # produced in that window is simply dropped instead of failing the worker.
+        if loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(broadcaster.push, message)
+        except RuntimeError:
+            pass
 
     worker = PoseWorker(
         camera=args.camera,
@@ -515,32 +615,53 @@ async def serve(args: argparse.Namespace, model_file: str, log: Callable[[str], 
         except (NotImplementedError, RuntimeError):
             pass  # Windows / non-main thread: KeyboardInterrupt still ends asyncio.run
 
-    async with ws_serve(broadcaster.handler, args.host, args.port, compression=None, max_queue=4):
-        log(f"[ws] serving PoseFrame v2 on ws://{args.host}:{args.port}  (model={args.model}, camera={args.camera})")
-        worker.start()
-        last_report = time.monotonic()
-        last_frames = 0
-        exit_code = 0
-        while not stop_event.is_set():
-            if worker.stopped:
-                if worker.error is not None:
-                    exit_code = 1
-                else:
-                    log("[worker] finished (preview closed or input ended)")
-                break
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=0.25)
-            except asyncio.TimeoutError:
-                pass
-            now = time.monotonic()
-            if now - last_report >= 5.0:
-                fps = (worker.frames - last_frames) / (now - last_report)
-                log(f"[status] inference {fps:4.1f} fps | detected {worker.detections}/{worker.frames} | clients {len(broadcaster.clients)}")
-                last_report = now
-                last_frames = worker.frames
-        log("[main] shutting down")
+    exit_code = 0
+    try:
+        try:
+            # Awaiting the Server binds the socket (same as `async with`); a busy port raises OSError here.
+            server = await ws_serve(
+                broadcaster.handler, args.host, args.port,
+                compression=None,        # frames are small; deflate would only add latency
+                ping_interval=10, ping_timeout=10,  # reap dead clients within ~20 s
+            )
+        except OSError as exc:
+            print(f"cannot listen on ws://{args.host}:{args.port}: {exc}", file=sys.stderr)
+            return 1
+        try:
+            log(f"[ws] serving PoseFrame v2 on ws://{args.host}:{args.port}  (model={args.model}, camera={args.camera})")
+            worker.start()
+            last_report = time.monotonic()
+            last_frames = 0
+            while not stop_event.is_set():
+                if worker.stopped:
+                    if worker.error is not None:
+                        exit_code = 1
+                    else:
+                        log("[worker] finished (preview closed or input ended)")
+                    break
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    pass
+                now = time.monotonic()
+                if now - last_report >= 5.0:
+                    fps = (worker.frames - last_frames) / (now - last_report)
+                    log(f"[status] inference {fps:4.1f} fps | detected {worker.detections}/{worker.frames}"
+                        f" | clients {len(broadcaster.clients)} | dropped {broadcaster.dropped}")
+                    last_report = now
+                    last_frames = worker.frames
+            log("[main] shutting down")
+        finally:
+            worker.stop()
+            server.close()
+            await server.wait_closed()
+    finally:
+        # Also reached on cancellation (KeyboardInterrupt on platforms without signal handlers).
         worker.stop()
-    worker.join(timeout=5.0)
+        if worker.is_alive():
+            worker.join(timeout=5.0)
+            if worker.is_alive():
+                log("[worker] did not stop within 5 s; exiting anyway")
     return exit_code
 
 

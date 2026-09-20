@@ -314,7 +314,7 @@ describe('PoseFilter confidence and presence', () => {
     out = f.process(nullFrame(633));
     expect(out.gated.every((g) => !g)).toBe(true);
     for (let t = 666; t < 3000; t += DT) out = f.process(nullFrame(t));
-    expect(out.absentFor).toBeCloseTo((2966 - lastPresentMs) / 1000, 9);
+    expect(out.absentFor).toBeCloseTo(out.t - lastPresentMs / 1000, 9);
     for (let i = 0; i < 33; i++) expect(Number.isFinite(out.world[i].x)).toBe(true);
 
     // The pose returns: ramp restarts from 0 and reaches 1 after reacquireRampMs.
@@ -322,9 +322,12 @@ describe('PoseFilter confidence and presence', () => {
     expect(out.present).toBe(true);
     expect(out.absentFor).toBe(0);
     expect(out.reacquireRamp).toBe(0);
-    out = runStatic(f, 3033, 3000 + SMOOTHING.reacquireRampMs);
+    out = runStatic(f, 3033, 3000 + SMOOTHING.reacquireRampMs + DT);
     expect(out.reacquireRamp).toBe(1);
+    // The visibility EMA decayed during the absence; every group (face needs 0.8) re-opens after its dwell.
+    out = runStatic(f, 3366, 3700);
     expect(out.gated.every((g) => g)).toBe(true);
+    expect(out.confidence.every((c) => c === 1)).toBe(true);
   });
 
   it('a first frame without a subject reports the time since the first frame', () => {

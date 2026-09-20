@@ -1,17 +1,15 @@
 /**
- * Pure skeleton data model used by the rig analysis.
+ * Bind pose and skeleton graph (docs/DESIGN.md §5.2, §5.3).
  *
- * A {@link SkeletonGraph} is a flat, index-addressed snapshot of a bone
- * hierarchy with world-space rest (bind pose) transforms. It carries no
- * three.js objects, so the mapper and the topology analysis can run in Node
- * and be unit-tested against synthetic rigs.
- *
- * Only the three.js *math* classes and the `Object3D` type are used here;
- * nothing touches the DOM.
+ * `applyBindPose` puts every skeleton under a loader root into the pose its
+ * inverse bind matrices describe, without `Skeleton.pose()`.
+ * `buildGraphFromObject3D` snapshots the named hierarchy (bones, empties and
+ * tail markers, never meshes) into a flat, index-addressed graph with world
+ * rest transforms, skin joint flags and summed skin weights. The graph carries
+ * no three.js objects, so the detectors run in Node.
  */
-import { Bone, Matrix4, Object3D, Quaternion, SkinnedMesh, Skeleton, Vector3 } from 'three';
+import { Bone, Camera, Light, Matrix4, Mesh, Object3D, Quaternion, Skeleton, SkinnedMesh, Vector3 } from 'three';
 import type { QuatTuple, Vec3Tuple } from '../core/types';
-import { fnv1a } from '../core/math';
 
 export interface SkeletonNode {
   /** Index in {@link SkeletonGraph.nodes}. Parents always precede children. */
@@ -20,85 +18,151 @@ export interface SkeletonNode {
   /** Parent index, or -1 for a root. */
   parent: number;
   children: number[];
-  /** World position in the bind pose. */
+  /** World position in the bind pose (loader-root space). */
   restPos: Vec3Tuple;
   /** World quaternion in the bind pose. */
   restQuat: QuatTuple;
+  /** True when the node is a skin joint of the primary skeleton group. */
+  isJoint: boolean;
+  /** Summed skin weight over every skinned mesh (0 for non-joints and unweighted joints). */
+  weight: number;
 }
 
 export interface SkeletonGraph {
   nodes: SkeletonNode[];
   /** Indices of nodes without a parent in the graph. */
   roots: number[];
-  /**
-   * Estimated meters per model unit from the skeleton's extent (1 for a
-   * meter-scale rig, 0.01 for a centimeter rig, 0.0254 for inches...).
-   * Undefined when the extent is degenerate.
-   */
-  unitHint?: number;
+  /** True when at least one skinned mesh contributed weights (then weight 0 means "unweighted"). */
+  hasSkinWeights: boolean;
+  skinnedMeshCount: number;
+  /** Notes produced while collecting (secondary skeletons, unnamed bones, ...). */
+  warnings: string[];
 }
 
 export interface BuildGraphOptions {
-  /**
-   * Include named non-bone nodes even when the hierarchy contains `Bone`
-   * objects. When the model has no bones at all, every named node is included
-   * regardless of this flag.
-   */
-  includeNonBones?: boolean;
+  /** Skin joints of the primary skeleton group. When omitted, every `Bone` counts as a joint. */
+  joints?: ReadonlySet<Object3D>;
+  /** Summed skin weight per joint (see {@link computeSkinWeights}). */
+  weights?: ReadonlyMap<Object3D, number>;
+  /** Subtrees to leave out entirely (VRM normalized proxy bones, helpers). */
+  exclude?: (obj: Object3D) => boolean;
+  skinnedMeshCount?: number;
+  warnings?: string[];
 }
 
-const _pos = new Vector3();
-const _quat = new Quaternion();
+/** Default exclusion: VRM `normalizedHumanBonesRoot` proxies and anything flagged by the loader. */
+export function defaultExclude(obj: Object3D): boolean {
+  if (obj.userData && obj.userData.excludeFromRig === true) return true;
+  return typeof obj.name === 'string' && obj.name.startsWith('Normalized_');
+}
+
 const _mat = new Matrix4();
-const _parentInv = new Matrix4();
+const _inv = new Matrix4();
+
+function maxAbsDiff(a: Matrix4, b: Matrix4): number {
+  let m = 0;
+  for (let i = 0; i < 16; i++) m = Math.max(m, Math.abs(a.elements[i] - b.elements[i]));
+  return m;
+}
 
 /**
- * Puts every skeleton under `root` into its bind pose and refreshes world
- * matrices, so that a graph built afterwards reflects the pose the skin
- * weights were painted for (see docs/DESIGN.md §5.3).
- *
- * This deliberately does not call `Skeleton.pose()`: that helper copies the
- * bind world matrix into the *local* matrix of every bone whose parent is not
- * a `Bone`, which is wrong whenever the top bone hangs under a transformed
- * node (the Meshy sample's `BaseArmature` carries a +90° X rotation, so the
- * skeleton would end up rotated twice). Here the bind world matrix
- * `inverse(boneInverse)` is converted to a local matrix against the parent's
- * actual world matrix instead. Each skeleton is processed once; a bone shared
- * by several skinned meshes keeps the first bind transform seen.
+ * Every skeleton under `root` (each visited once) in the order the skinned
+ * meshes are met.
  */
-export function applyBindPose(root: Object3D): void {
+export function collectSkeletons(root: Object3D, exclude: (obj: Object3D) => boolean = defaultExclude): { skeleton: Skeleton; meshes: SkinnedMesh[] }[] {
+  const out: { skeleton: Skeleton; meshes: SkinnedMesh[] }[] = [];
+  const byskel = new Map<Skeleton, { skeleton: Skeleton; meshes: SkinnedMesh[] }>();
+  const visit = (obj: Object3D): void => {
+    if (exclude(obj)) return;
+    const mesh = obj as SkinnedMesh;
+    if (mesh.isSkinnedMesh && mesh.skeleton) {
+      let entry = byskel.get(mesh.skeleton);
+      if (!entry) {
+        entry = { skeleton: mesh.skeleton, meshes: [] };
+        byskel.set(mesh.skeleton, entry);
+        out.push(entry);
+      }
+      entry.meshes.push(mesh);
+    }
+    for (const c of obj.children) visit(c);
+  };
+  visit(root);
+  return out;
+}
+
+/**
+ * Puts every skeleton under `root` into its bind pose (docs/DESIGN.md §5.3):
+ *
+ * 1. `G_i = inverse(boneInverses[i])` is joint i's bind world matrix in
+ *    loader-root space (GLTFLoader binds with the identity matrix; FBXLoader's
+ *    inverses come from the cluster TransformLink, and three's skinning is
+ *    Σw·(boneWorld·boneInverse)·bindMatrix, so boneWorld = inverse(boneInverse)
+ *    at bind time in both cases).
+ * 2. The parent's bind world `P` is its own `G` when it is a joint, else the
+ *    parent's actual world matrix from the file's node transforms (composed
+ *    through any bind-posed joints above it).
+ * 3. `bone.matrix = inverse(P)·G_i`, decomposed, parents first. Joints shared
+ *    by several skins keep the first bind transform; disagreeing inverse bind
+ *    matrices (> 1e-3) are reported.
+ * 4. Non-joint ancestors keep their file transforms.
+ *
+ * `Skeleton.pose()` is deliberately not used: it copies the bind world matrix
+ * into the local matrix of every bone whose parent is not a `Bone`, which
+ * double-applies any transform on a non-bone ancestor (the sample rig's
+ * `BaseArmature` carries a +90° X rotation).
+ *
+ * Call with the loader root at identity, before any normalization. Rigs without
+ * skins keep their node transforms.
+ */
+export function applyBindPose(root: Object3D, opts: { exclude?: (obj: Object3D) => boolean } = {}): { warnings: string[]; jointCount: number } {
+  const warnings: string[] = [];
   root.updateMatrixWorld(true);
   const targets = new Map<Object3D, Matrix4>();
-  const seen = new Set<Skeleton>();
-  root.traverse((obj) => {
-    const mesh = obj as SkinnedMesh;
-    if (!mesh.isSkinnedMesh || !mesh.skeleton) return;
-    const skeleton = mesh.skeleton;
-    if (seen.has(skeleton)) return;
-    seen.add(skeleton);
+  for (const { skeleton } of collectSkeletons(root, opts.exclude ?? defaultExclude)) {
     for (let i = 0; i < skeleton.bones.length; i++) {
       const bone = skeleton.bones[i];
       const inv = skeleton.boneInverses[i];
-      if (!bone || !inv || targets.has(bone)) continue;
+      if (!bone || !inv) continue;
       const world = new Matrix4().copy(inv).invert();
-      if (!isFinite(world.elements[0])) continue;
+      if (!Number.isFinite(world.elements[0]) || !Number.isFinite(world.elements[15])) continue;
+      const prev = targets.get(bone);
+      if (prev) {
+        const d = maxAbsDiff(prev, world);
+        if (d > 1e-3) warnings.push(`Joint '${bone.name}' is shared by several skins whose inverse bind matrices disagree (max diff ${d.toExponential(1)}); keeping the first.`);
+        continue;
+      }
       targets.set(bone, world);
     }
-  });
-  if (targets.size === 0) return;
+  }
+  if (targets.size === 0) return { warnings, jointCount: 0 };
 
   // Parent-first ordering so a parent's world matrix is settled before its children.
   const ordered: Object3D[] = [];
   root.traverse((obj) => {
     if (targets.has(obj)) ordered.push(obj);
   });
+
+  // World matrix of any node given the joints already placed: joints use their
+  // bind world, everything else composes its file transform on its parent.
+  const worldCache = new Map<Object3D, Matrix4>();
+  const worldOf = (obj: Object3D): Matrix4 => {
+    const t = targets.get(obj);
+    if (t) return t;
+    const cached = worldCache.get(obj);
+    if (cached) return cached;
+    let m: Matrix4;
+    if (obj === root || !obj.parent) m = obj.matrixWorld.clone();
+    else m = new Matrix4().multiplyMatrices(worldOf(obj.parent), obj.matrix);
+    worldCache.set(obj, m);
+    return m;
+  };
+
   for (const bone of ordered) {
     const world = targets.get(bone)!;
     const parent = bone.parent;
     if (parent) {
-      const parentWorld = targets.get(parent) ?? parent.matrixWorld;
-      _parentInv.copy(parentWorld).invert();
-      _mat.multiplyMatrices(_parentInv, world);
+      _inv.copy(worldOf(parent)).invert();
+      _mat.multiplyMatrices(_inv, world);
     } else {
       _mat.copy(world);
     }
@@ -106,38 +170,152 @@ export function applyBindPose(root: Object3D): void {
     bone.updateMatrix();
   }
   root.updateMatrixWorld(true);
+  return { warnings, jointCount: targets.size };
 }
 
 /**
- * Collects the bone hierarchy under `root` into a {@link SkeletonGraph}.
- * World transforms are read with `getWorldPosition` / `getWorldQuaternion`
- * after `root.updateMatrixWorld(true)`, so call {@link applyBindPose} first
- * when the rest pose should be the bind pose.
+ * Sums the skin weight per joint over every skinned mesh under `root`
+ * (each geometry/skeleton pair counted once). Joints of every skeleton are
+ * present in the map (weight 0 when unweighted).
+ */
+export function computeSkinWeights(root: Object3D, exclude: (obj: Object3D) => boolean = defaultExclude): Map<Object3D, number> {
+  const weights = new Map<Object3D, number>();
+  const seen = new Set<string>();
+  for (const { skeleton, meshes } of collectSkeletons(root, exclude)) {
+    for (const bone of skeleton.bones) if (bone && !weights.has(bone)) weights.set(bone, 0);
+    for (const mesh of meshes) {
+      const geom = mesh.geometry;
+      if (!geom) continue;
+      const key = `${geom.uuid}|${skeleton.uuid}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const idx = geom.getAttribute('skinIndex');
+      const wgt = geom.getAttribute('skinWeight');
+      if (!idx || !wgt) continue;
+      const n = Math.min(idx.count, wgt.count);
+      const items = Math.min(idx.itemSize, wgt.itemSize);
+      for (let v = 0; v < n; v++) {
+        for (let k = 0; k < items; k++) {
+          const w = wgt.getComponent(v, k);
+          if (!(w > 0)) continue;
+          const bone = skeleton.bones[idx.getComponent(v, k)];
+          if (!bone) continue;
+          weights.set(bone, (weights.get(bone) ?? 0) + w);
+        }
+      }
+    }
+  }
+  return weights;
+}
+
+export interface SkinGroup {
+  /** Joints of every skin in the group (skins sharing at least one joint are merged). */
+  joints: Set<Object3D>;
+  /** Summed skin weight of the group. */
+  weight: number;
+  skinCount: number;
+}
+
+/**
+ * Groups skins that share at least one joint and returns the groups sorted by
+ * summed weight (largest first). The first group is the primary skeleton.
+ */
+export function groupSkins(skins: readonly { joints: readonly Object3D[] }[], weights: ReadonlyMap<Object3D, number>): SkinGroup[] {
+  const parent = skins.map((_, i) => i);
+  const find = (i: number): number => {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]];
+      i = parent[i];
+    }
+    return i;
+  };
+  const owner = new Map<Object3D, number>();
+  skins.forEach((skin, i) => {
+    for (const j of skin.joints) {
+      const o = owner.get(j);
+      if (o === undefined) owner.set(j, i);
+      else parent[find(i)] = find(o);
+    }
+  });
+  const groups = new Map<number, SkinGroup>();
+  skins.forEach((skin, i) => {
+    const r = find(i);
+    let g = groups.get(r);
+    if (!g) {
+      g = { joints: new Set(), weight: 0, skinCount: 0 };
+      groups.set(r, g);
+    }
+    g.skinCount++;
+    for (const j of skin.joints) g.joints.add(j);
+  });
+  for (const g of groups.values()) for (const j of g.joints) g.weight += weights.get(j) ?? 0;
+  return [...groups.values()].sort((a, b) => b.weight - a.weight || b.joints.size - a.joints.size);
+}
+
+/** Primary skeleton joints and warnings about secondary skeletons for a loaded object tree. */
+export function selectPrimarySkeleton(root: Object3D, exclude: (obj: Object3D) => boolean = defaultExclude): { joints: Set<Object3D>; weights: Map<Object3D, number>; skinnedMeshCount: number; warnings: string[] } {
+  const skeletons = collectSkeletons(root, exclude);
+  const weights = computeSkinWeights(root, exclude);
+  const groups = groupSkins(skeletons.map((s) => ({ joints: s.skeleton.bones })), weights);
+  const warnings: string[] = [];
+  const joints = groups.length ? groups[0].joints : new Set<Object3D>();
+  for (let i = 1; i < groups.length; i++) {
+    const g = groups[i];
+    const sample = [...g.joints].slice(0, 3).map((j) => `'${j.name}'`).join(', ');
+    warnings.push(`Secondary skeleton ignored (${g.joints.size} joints, ${g.skinCount} skin(s), weight ${g.weight.toFixed(1)}; e.g. ${sample}).`);
+  }
+  let skinnedMeshCount = 0;
+  for (const s of skeletons) skinnedMeshCount += s.meshes.length;
+  return { joints, weights, skinnedMeshCount, warnings };
+}
+
+const _pos = new Vector3();
+const _quat = new Quaternion();
+
+function isNonBoneLeafObject(obj: Object3D): boolean {
+  return !!(obj as Mesh).isMesh || !!(obj as Light).isLight || !!(obj as Camera).isCamera;
+}
+
+/**
+ * Collects every named descendant of `root` (bones, empties, tail markers;
+ * never meshes, lights or cameras) into a {@link SkeletonGraph}. World
+ * transforms are read after `root.updateMatrixWorld(true)`, so call
+ * {@link applyBindPose} first when the rest pose should be the bind pose.
+ * Unnamed bones receive a stable placeholder name (`Bone_<n>`) so they can be
+ * addressed by the map.
  */
 export function buildGraphFromObject3D(root: Object3D, opts: BuildGraphOptions = {}): SkeletonGraph {
   root.updateMatrixWorld(true);
-  let hasBones = false;
-  root.traverse((obj) => {
-    if ((obj as Bone).isBone) hasBones = true;
-  });
-  const includeAll = !hasBones || !!opts.includeNonBones;
+  const exclude = opts.exclude ?? defaultExclude;
+  const warnings = opts.warnings ? [...opts.warnings] : [];
+  const weights = opts.weights;
+  const joints = opts.joints;
 
   const indexOf = new Map<Object3D, number>();
   const objects: Object3D[] = [];
-  root.traverse((obj) => {
-    const isBone = !!(obj as Bone).isBone;
-    if (!isBone && !(includeAll && obj.name && !(obj as SkinnedMesh).isMesh)) return;
-    if (!isBone && obj === root && !opts.includeNonBones) return;
-    indexOf.set(obj, objects.length);
-    objects.push(obj);
-  });
+  let unnamed = 0;
+  const visit = (obj: Object3D): void => {
+    if (obj !== root) {
+      if (exclude(obj)) return;
+      if (!isNonBoneLeafObject(obj)) {
+        if (!obj.name && (obj as Bone).isBone) obj.name = `Bone_${++unnamed}`;
+        if (obj.name) {
+          indexOf.set(obj, objects.length);
+          objects.push(obj);
+        }
+      }
+    }
+    for (const c of obj.children) visit(c);
+  };
+  visit(root);
+  if (unnamed > 0) warnings.push(`${unnamed} unnamed bone(s) were given placeholder names.`);
 
   const nodes: SkeletonNode[] = objects.map((obj, index) => {
     obj.getWorldPosition(_pos);
     obj.getWorldQuaternion(_quat);
     let p: Object3D | null = obj.parent;
     let parent = -1;
-    while (p) {
+    while (p && p !== root) {
       const pi = indexOf.get(p);
       if (pi !== undefined) {
         parent = pi;
@@ -145,6 +323,8 @@ export function buildGraphFromObject3D(root: Object3D, opts: BuildGraphOptions =
       }
       p = p.parent;
     }
+    const isJoint = joints ? joints.has(obj) : !!(obj as Bone).isBone;
+    const weight = weights ? (weights.get(obj) ?? 0) : isJoint ? 1 : 0;
     return {
       index,
       name: obj.name,
@@ -152,23 +332,26 @@ export function buildGraphFromObject3D(root: Object3D, opts: BuildGraphOptions =
       children: [],
       restPos: [_pos.x, _pos.y, _pos.z],
       restQuat: [_quat.x, _quat.y, _quat.z, _quat.w],
+      isJoint,
+      weight,
     };
   });
-  return finalizeGraph(nodes);
+  const graph = finalizeGraph(nodes);
+  graph.hasSkinWeights = !!weights && weights.size > 0;
+  graph.skinnedMeshCount = opts.skinnedMeshCount ?? 0;
+  graph.warnings = warnings;
+  return graph;
 }
 
-/** Fills children/roots and the unit hint for a node list whose `parent` fields are set. */
+/** Fills children/roots for a node list whose `parent` fields are set. */
 export function finalizeGraph(nodes: SkeletonNode[]): SkeletonGraph {
   const roots: number[] = [];
   for (const n of nodes) n.children = [];
   for (const n of nodes) {
-    if (n.parent >= 0 && n.parent < nodes.length) nodes[n.parent].children.push(n.index);
+    if (n.parent >= 0 && n.parent < nodes.length && n.parent !== n.index) nodes[n.parent].children.push(n.index);
     else roots.push(n.index);
   }
-  const graph: SkeletonGraph = { nodes, roots };
-  const extent = graphExtent(graph);
-  if (extent > 0) graph.unitHint = unitHintFromExtent(extent);
-  return graph;
+  return { nodes, roots, hasSkinWeights: false, skinnedMeshCount: 0, warnings: [] };
 }
 
 /** Largest axis-aligned extent of the rest positions. */
@@ -183,16 +366,6 @@ export function graphExtent(graph: SkeletonGraph): number {
     }
   }
   return Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2]);
-}
-
-/** Guesses meters-per-unit from a humanoid extent (height-ish) in model units. */
-export function unitHintFromExtent(extent: number): number {
-  if (!(extent > 0)) return 1;
-  if (extent >= 0.4 && extent <= 4) return 1;
-  if (extent > 4 && extent < 40) return 0.1;
-  if (extent >= 40 && extent <= 400) return 0.01;
-  if (extent > 400) return 0.001;
-  return 1;
 }
 
 /** True when `descendant` lies in the subtree of `ancestor` (not equal). */
@@ -235,19 +408,37 @@ export function ancestors(graph: SkeletonGraph, index: number): number[] {
   return out;
 }
 
-export function findNodeByName(graph: SkeletonGraph, name: string): SkeletonNode | undefined {
-  return graph.nodes.find((n) => n.name === name);
+/** Lowest common ancestor of the given nodes (a node is its own ancestor), or -1. */
+export function lca(graph: SkeletonGraph, indices: readonly number[]): number {
+  if (indices.length === 0) return -1;
+  let common: number[] | null = null;
+  for (const i of indices) {
+    const chain = [i, ...ancestors(graph, i)];
+    if (!common) {
+      common = chain;
+      continue;
+    }
+    const set = new Set(chain);
+    common = common.filter((c) => set.has(c));
+    if (common.length === 0) return -1;
+  }
+  return common ? common[0] : -1;
 }
 
-/**
- * Stable hash of the bone hierarchy: FNV-1a over the sorted `child<parent`
- * name pairs. Independent of node order, positions and units, so a re-export
- * of the same rig yields the same profile key.
- */
-export function fingerprintGraph(graph: SkeletonGraph): string {
-  const pairs = graph.nodes.map((n) => `${n.name}<${n.parent >= 0 ? graph.nodes[n.parent].name : ''}`);
-  pairs.sort();
-  return fnv1a(pairs.join('\n'));
+/** Nodes strictly below `ancestor` down to and including `descendant`, top first. Empty when unrelated. */
+export function pathDown(graph: SkeletonGraph, ancestor: number, descendant: number): number[] {
+  const out: number[] = [];
+  let cur = descendant;
+  while (cur >= 0 && cur !== ancestor) {
+    out.push(cur);
+    cur = graph.nodes[cur].parent;
+  }
+  if (cur !== ancestor) return [];
+  return out.reverse();
+}
+
+export function findNodeByName(graph: SkeletonGraph, name: string): SkeletonNode | undefined {
+  return graph.nodes.find((n) => n.name === name);
 }
 
 /** Convenience: world position of a node as a Vector3. */
@@ -260,4 +451,23 @@ export function linkLength(graph: SkeletonGraph, index: number, child: number): 
   const a = graph.nodes[index].restPos;
   const b = graph.nodes[child].restPos;
   return Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+}
+
+/** Sum of link lengths over the subtree of `index` (all descendants). */
+export function subtreeLength(graph: SkeletonGraph, index: number): number {
+  let total = 0;
+  const stack = [index];
+  while (stack.length) {
+    const i = stack.pop()!;
+    for (const c of graph.nodes[i].children) {
+      total += linkLength(graph, i, c);
+      stack.push(c);
+    }
+  }
+  return total;
+}
+
+/** True when the graph has at least one skin joint. */
+export function hasJoints(graph: SkeletonGraph): boolean {
+  return graph.nodes.some((n) => n.isJoint);
 }

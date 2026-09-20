@@ -1,398 +1,307 @@
 /**
- * Bone name normalization, the synonym lexicon and the name-based role
- * detector (docs/DESIGN.md §5.4, "Name detector").
+ * Name detector (docs/DESIGN.md §5.4): namespace-prefix stripping, side
+ * detection, longest-phrase-first tokenization, helper classification and the
+ * CLASS + SIDE + ORDINAL output per bone. Names never decide roles here; the
+ * chain order does (topology.ts). Only two decisions are name-driven and both
+ * are taken by the topology step from the information produced here: the
+ * shoulder-vs-upperArm rule and finger digit identity.
  *
  * Pure: no three.js, no DOM.
  */
-import type { HumanoidBone, Side } from '../core/types';
-import type { SkeletonGraph } from './skeletonGraph';
+import type { RigFamily } from '../core/types';
 
-export type NameSide = Side | null;
+export type NameSide = 'left' | 'right' | 'center' | null;
+export type BoneGroup = 'torso' | 'arm' | 'leg' | 'finger' | 'face' | 'ignore' | 'marker' | 'unknown';
+/** Group plus side for the limb groups: `armL`, `legR`, ... */
+export type BoneClass = 'torso' | 'arm' | 'armL' | 'armR' | 'leg' | 'legL' | 'legR' | 'finger' | 'face' | 'ignore' | 'marker' | 'unknown';
+export type FingerDigit = 'Thumb' | 'Index' | 'Middle' | 'Ring' | 'Little';
+export type FingerSegment = 'Metacarpal' | 'Proximal' | 'Intermediate' | 'Distal' | 'Tip';
 
-export interface NormalizedBoneName {
-  /** Lower-case tokens without side tokens (digits are separate tokens). */
-  tokens: string[];
-  side: NameSide;
-  raw: string;
-  /** Name with namespace prefixes removed. */
-  stripped: string;
+export interface FingerInfo {
+  digit: FingerDigit;
+  /** Segment from a segment word or a 1..4 ordinal (thumb: 1 = metacarpal; others: 1 = proximal), or null. */
+  segment: FingerSegment | null;
+  ordinal: number | null;
 }
 
-/** Namespace / rig-family prefixes removed before tokenizing. Order matters. */
+export interface BoneNameInfo {
+  raw: string;
+  /** Name after namespace-prefix removal (case preserved). */
+  stripped: string;
+  /** Lower-case tokens after phrase merging; side tokens removed; digits are separate tokens. */
+  tokens: string[];
+  side: NameSide;
+  /** Tokens minus side, twist/roll/bend and numeric tokens, joined (`lShldrTwist` -> `shldr`). */
+  stem: string;
+  /** Last numeric token, or null. */
+  ordinal: number | null;
+  /** Carries a `twist` or `roll` token. */
+  twist: boolean;
+  /** Carries a `.NNN` three-digit segment suffix (Rigify B-bone segments). */
+  segment: boolean;
+  group: BoneGroup;
+  class: BoneClass;
+  /** Lexicon word that decided the group (e.g. `forearm`, `toebase`), or null. */
+  keyword: string | null;
+  finger: FingerInfo | null;
+  /** Tail-marker token present (`end`, `nub`, `tip`, `site`, `leaf`), regardless of leaf/weight status. */
+  markerToken: boolean;
+}
+
+/** Hierarchy context that helper classification needs (leaf status, skin weight). */
+export interface BoneNodeContext {
+  isLeaf: boolean;
+  /** Summed skin weight; ignored when `hasWeights` is false. */
+  weight: number;
+  hasWeights: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Prefixes and tokenization
+// ---------------------------------------------------------------------------
+
+/** True namespace prefixes only (never `Armature|`, `Armature_`, `root|`). */
 const PREFIX_PATTERNS: RegExp[] = [
-  /^mixamorig\d*[:_]/i,
-  /^Armature[|_.:]/i,
+  /^mixamorig\d*:?/i,
   /^DEF-/,
   /^ORG-/,
   /^MCH-/,
-  /^(DEF|ORG|MCH)_/i,
-  /^J_Sec_/,
-  /^J_Opt_/,
-  /^Bip0?0?1[ _]/i,
   /^CC_Base_/i,
-  /^Character\d*[_:]/i,
-  /^Genesis\d*(Female|Male)?[_:]?(?=[A-Za-z])/,
-  /^root\|/i,
-  /^b_/i,
+  /^Character1_/i,
+  /^Genesis\d*(Female|Male)?_?(?=[A-Za-z])/,
+  /^Bip0?0?1[\s_]/i,
   /^bone_/i,
-  /^[^:|]+[:|]/, // any remaining "namespace:" or "Object|" prefix
+  /^b_/i,
 ];
 
-const SIDE_TOKENS: Record<string, Side> = {
-  left: 'left',
-  right: 'right',
-  l: 'left',
-  r: 'right',
-  lt: 'left',
-  rt: 'right',
-  lft: 'left',
-  rgt: 'right',
-  c: 'center',
-  m: 'center',
-  center: 'center',
-  centre: 'center',
-};
+/** VRoid secondary/adjust/optional bones: never roles. */
+const VROID_IGNORE = /^J_(Sec|Adj|Opt)_/;
 
-const _cache = new Map<string, NormalizedBoneName>();
-
-/**
- * Strips namespace prefixes, detects the side and splits the remainder into
- * lower-case tokens (camelCase, snake_case, dots, spaces and digit boundaries).
- */
-export function normalizeBoneName(name: string): NormalizedBoneName {
-  const cached = _cache.get(name);
-  if (cached) return cached;
-
-  let side: NameSide = null;
+/** Strips namespace prefixes; `J_Bip_` keeps its `C_/L_/R_` as the side. */
+export function stripPrefix(name: string): { stripped: string; side: NameSide } {
   let s = name.trim();
-
-  const vroid = /^J_(Bip|Adj)_([CLR])_/.exec(s);
+  let side: NameSide = null;
+  const vroid = /^J_Bip_(?:([CLR])_)?/.exec(s);
   if (vroid) {
-    side = vroid[2] === 'L' ? 'left' : vroid[2] === 'R' ? 'right' : 'center';
     s = s.slice(vroid[0].length);
+    if (vroid[1] === 'L') side = 'left';
+    else if (vroid[1] === 'R') side = 'right';
+    else if (vroid[1] === 'C') side = 'center';
+    return { stripped: s, side };
   }
-
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const re of PREFIX_PATTERNS) {
-      const m = re.exec(s);
-      if (m && m[0].length > 0 && m[0].length < s.length) {
-        s = s.slice(m[0].length);
-        changed = true;
-      }
+  for (const re of PREFIX_PATTERNS) {
+    const m = re.exec(s);
+    if (m && m[0].length > 0 && m[0].length < s.length) {
+      s = s.slice(m[0].length);
+      break;
     }
   }
-  const stripped = s;
+  return { stripped: s, side };
+}
 
-  // Glued lower-case "leftarm" / "armleft" forms that camelCase splitting cannot separate.
-  let body = stripped;
-  const lower = body.toLowerCase();
-  const lead = /^(left|right)(?=[a-z_.\-\s0-9])/i.exec(lower);
-  if (lead && body.length > lead[0].length && /^[a-z]+$/.test(body.slice(0, lead[0].length))) {
-    side = side ?? (lead[1] === 'left' ? 'left' : 'right');
-    body = body.slice(lead[0].length);
-  } else {
-    const trail = /(left|right)$/i.exec(lower);
-    if (trail && body.length > trail[0].length && /^[a-z]+$/.test(body.slice(body.length - trail[0].length))) {
-      side = side ?? (trail[1] === 'left' ? 'left' : 'right');
-      body = body.slice(0, body.length - trail[0].length);
-    }
-  }
+/** Multi-word lexicon phrases merged into one token (longest first). */
+const PHRASES = [
+  'centerofmass',
+  'upperchest',
+  'lowerchest',
+  'collarbone',
+  'metatarsals',
+  'metatarsal',
+  'upperarm',
+  'lowerarm',
+  'upperleg',
+  'lowerleg',
+  'forearm',
+  'toebase',
+  'headtop',
+  'kneeback',
+  'eyelid',
+  'eyeball',
+  'faceeye',
+  'anklebck',
+  'anklefwd',
+  'bigtoe',
+  'smalltoe',
+  'lowerjaw',
+  'upperjaw',
+  'jawroot',
+  'upleg',
+];
+const PHRASE_SET = new Set(PHRASES);
+const MAX_PHRASE_TOKENS = 3;
 
-  let spaced = body
+function splitRaw(s: string): string[] {
+  const spaced = s
     .replace(/([a-z])([A-Z])/g, '$1 $2')
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
     .replace(/([A-Za-z])(\d)/g, '$1 $2')
     .replace(/(\d)([A-Za-z])/g, '$1 $2');
-  const rawTokens = spaced
+  return spaced
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .filter((t) => t.length > 0);
+}
 
+/** Merges consecutive tokens that form a lexicon phrase, longest phrase first. */
+export function mergePhrases(tokens: string[]): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < tokens.length) {
+    let merged = false;
+    for (let n = Math.min(MAX_PHRASE_TOKENS, tokens.length - i); n >= 2; n--) {
+      const joined = tokens.slice(i, i + n).join('');
+      if (PHRASE_SET.has(joined)) {
+        out.push(joined);
+        i += n;
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      out.push(tokens[i]);
+      i++;
+    }
+  }
+  return out;
+}
+
+/**
+ * Splits a prefix-stripped name into lower-case tokens and extracts the side:
+ * `left|right` words, `l|r` single-letter tokens (`.L`, `_L`, `L_`, UE5 `_l`,
+ * Daz `lShldrBend` whose leading `l` splits off at the capital), and glued
+ * lower-case `leftfoot`.
+ */
+export function tokenize(stripped: string, presetSide: NameSide = null): { tokens: string[]; side: NameSide } {
+  const raw = splitRaw(stripped);
+  const expanded: string[] = [];
+  for (const t of raw) {
+    const glued = /^(left|right)([a-z]{2,})$/.exec(t);
+    if (glued) {
+      expanded.push(glued[1], glued[2]);
+    } else expanded.push(t);
+  }
+  let side: NameSide = presetSide;
+  let contradiction = false;
   const tokens: string[] = [];
-  for (let i = 0; i < rawTokens.length; i++) {
-    const t = rawTokens[i];
-    const st = SIDE_TOKENS[t];
-    if (st !== undefined && (t.length > 1 || i === 0 || i === rawTokens.length - 1 || side === null)) {
-      if (side === null || side === 'center') side = st === 'center' && side ? side : st;
+  for (const t of expanded) {
+    let s: NameSide = null;
+    if (t === 'left' || t === 'l') s = 'left';
+    else if (t === 'right' || t === 'r') s = 'right';
+    if (s) {
+      if (side && side !== 'center' && side !== s) contradiction = true;
+      side = s;
       continue;
     }
     tokens.push(t);
   }
-
-  const out: NormalizedBoneName = { tokens, side, raw: name, stripped };
-  _cache.set(name, out);
-  return out;
+  if (contradiction) side = null;
+  return { tokens: mergePhrases(tokens), side };
 }
 
-/** Tokens without digits, joined; e.g. `LeftHandThumb1` -> `handthumb`. */
-export function nameKey(n: NormalizedBoneName): string {
-  return n.tokens.filter((t) => !/^\d+$/.test(t)).join('');
-}
+// ---------------------------------------------------------------------------
+// Lexicons (whole tokens)
+// ---------------------------------------------------------------------------
 
-/** Last numeric token as a number, or null. */
-export function numericSuffix(n: NormalizedBoneName): number | null {
-  for (let i = n.tokens.length - 1; i >= 0; i--) {
-    if (/^\d+$/.test(n.tokens[i])) return parseInt(n.tokens[i], 10);
-  }
-  return null;
-}
+const MARKER_TOKENS = new Set(['end', 'nub', 'tip', 'site', 'leaf', 'endsite']);
 
-const HELPER_TOKENS = new Set([
-  'twist',
-  'roll',
+const IGNORE_TOKENS = new Set([
   'ik',
   'fk',
-  'pole',
-  'nub',
-  'end',
-  'tip',
-  'target',
+  'mch',
   'ctrl',
-  'control',
-  'controller',
-  'helper',
-  'attach',
-  'attachment',
+  'ctl',
+  'con',
+  'pole',
+  'target',
+  'tweak',
   'prop',
   'weapon',
-  'gun',
-  'sword',
-  'shield',
-  'eyelid',
-  'lid',
-  'lids',
+  'socket',
+  'attach',
+  'centerofmass',
+  'interaction',
+  'camera',
+  'heel',
+  'sole',
+  'anklebck',
+  'anklefwd',
+  'bck',
+  'fwd',
   'hair',
   'skirt',
   'breast',
+  'breasts',
   'bust',
   'boob',
   'tail',
   'wing',
   'wings',
-  'cloth',
-  'cape',
-  'scarf',
-  'sleeve',
-  'dress',
-  'coat',
-  'ponytail',
-  'bang',
-  'bangs',
-  'tongue',
-  'teeth',
-  'tooth',
-  'ear',
-  'ears',
-  'nose',
-  'cheek',
-  'brow',
-  'eyebrow',
-  'glasses',
-  'hat',
-  'palm',
+  'eyelid',
+  'lid',
+  'lids',
+  // UE5 side-branch correctives and similar helpers.
   'corrective',
-  'driver',
-  'dummy',
-  'aux',
-  'muscle',
-  'volume',
-  'socket',
-  'camera',
-  'light',
-  'jiggle',
-  'physics',
-  'spring',
-  'dynamic',
-  'grip',
-  'handle',
-  'holder',
-  'item',
-  'accessory',
-  'armor',
-  'armour',
-  'opt',
+  'correctiveroot',
+  'latissimus',
+  'scap',
+  'pec',
+  'inner',
+  'outer',
+  'out',
+  'in',
+  'kneeback',
+  'cor',
   'ribs',
   'pectoral',
   'trapezius',
   'scapula',
-  'bigtoe',
-  'smalltoe',
-  'eff',
-  'effector',
-  'bbone',
-  'stretch',
-  'tweak',
-  'mech',
-  'vis',
-  'widget',
-  'mirror',
 ]);
 
-const TAIL_TOKENS = new Set(['end', 'nub', 'tip', 'endsite', 'eff', 'effector', 'leaf']);
-
-/**
- * Bones that must never take a body role: twist/roll helpers, IK/pole targets,
- * tail markers, props and secondary motion bones (hair, skirt, breast, tail...).
- */
-export function isHelperBone(name: string): boolean {
-  // Rigify ORG-/MCH- bones mirror the DEF- hierarchy but carry no skin weights.
-  if (/^(ORG|MCH)[-_]/.test(name)) return true;
-  const n = normalizeBoneName(name);
-  const key = nameKey(n);
-  // Character Creator names its real neck bones NeckTwist01/02.
-  if (key === 'necktwist') return false;
-  for (const t of n.tokens) {
-    if (HELPER_TOKENS.has(t)) return true;
-  }
-  return false;
-}
-
-/** Leaf "tail" markers (`*_end`, `*Nub`, `*Tip`): tail hints only, never roles. */
-export function isTailMarker(name: string): boolean {
-  const n = normalizeBoneName(name);
-  return n.tokens.some((t) => TAIL_TOKENS.has(t));
-}
-
-/**
- * True when `name` is a continuation segment of `parentName`: same key with
- * an extra numeric suffix (Rigify B-bone segments `DEF-upper_arm.L.001`).
- */
-export function isSegmentOf(name: string, parentName: string): boolean {
-  const a = normalizeBoneName(name);
-  const b = normalizeBoneName(parentName);
-  if (a.side !== b.side || (a.side !== 'left' && a.side !== 'right')) return false;
-  const ka = nameKey(a);
-  const kb = nameKey(b);
-  if (!ka || ka !== kb || !(ka in SIDE_LEXICON)) return false;
-  const na = numericSuffix(a);
-  const nb = numericSuffix(b);
-  return na !== null && (nb === null || na > nb) && a.tokens.length === b.tokens.length + (nb === null ? 1 : 0);
-}
-
-// ---------------------------------------------------------------------------
-// Lexicon
-// ---------------------------------------------------------------------------
-
-type CenterRole = 'hips' | 'spine' | 'chest' | 'upperChest' | 'neck' | 'head' | 'jaw';
-type SideRole =
-  | 'Shoulder'
-  | 'UpperArm'
-  | 'LowerArm'
-  | 'Hand'
-  | 'UpperLeg'
-  | 'LowerLeg'
-  | 'Foot'
-  | 'Toes'
-  | 'Eye';
-
-/** Key -> [role, score] for roles that must not carry a side token. */
-const CENTER_LEXICON: Record<string, [CenterRole, number]> = {
-  hips: ['hips', 1],
-  hip: ['hips', 0.9],
-  pelvis: ['hips', 0.9],
-  cog: ['hips', 0.5],
-  root: ['hips', 0.3],
-  spine: ['spine', 1],
-  spinelower: ['spine', 0.9],
-  lowerspine: ['spine', 0.9],
-  spinemiddle: ['spine', 0.85],
-  spineupper: ['chest', 0.8],
-  upperspine: ['chest', 0.8],
-  abdomen: ['spine', 0.9],
-  abdomenlower: ['spine', 0.95],
-  abdomenupper: ['spine', 0.9],
-  waist: ['spine', 0.9],
-  torso: ['spine', 0.8],
-  lowerback: ['spine', 0.8],
-  back: ['spine', 0.5],
-  belly: ['spine', 0.6],
-  stomach: ['spine', 0.6],
-  body: ['spine', 0.4],
-  chest: ['chest', 1],
-  chestlower: ['chest', 0.95],
-  lowerchest: ['chest', 0.95],
-  thorax: ['chest', 0.8],
-  ribcage: ['chest', 0.7],
-  upperbody: ['chest', 0.6],
-  upperchest: ['upperChest', 1],
-  chestupper: ['upperChest', 1],
-  neck: ['neck', 1],
-  necktwist: ['neck', 0.9],
-  necklower: ['neck', 0.95],
-  neckupper: ['neck', 0.8],
-  cervical: ['neck', 0.7],
-  head: ['head', 1],
-  skull: ['head', 0.8],
-  jaw: ['jaw', 1],
-  jawroot: ['jaw', 0.9],
-  lowerjaw: ['jaw', 0.95],
-  chin: ['jaw', 0.6],
-  mandible: ['jaw', 0.8],
-};
-
-/** Key -> [role suffix, score] for roles that require a side token. */
-const SIDE_LEXICON: Record<string, [SideRole, number]> = {
-  shoulder: ['Shoulder', 1],
-  clavicle: ['Shoulder', 1],
-  clav: ['Shoulder', 0.9],
-  collar: ['Shoulder', 1],
-  collarbone: ['Shoulder', 0.9],
-  upperarm: ['UpperArm', 1],
-  uparm: ['UpperArm', 1],
-  arm: ['UpperArm', 0.95],
-  armupper: ['UpperArm', 1],
-  humerus: ['UpperArm', 0.9],
-  bicep: ['UpperArm', 0.8],
-  biceps: ['UpperArm', 0.8],
-  shldr: ['UpperArm', 0.95],
-  shldrbend: ['UpperArm', 1],
-  shoulderbend: ['UpperArm', 0.9],
-  upperarmbend: ['UpperArm', 1],
-  forearm: ['LowerArm', 1],
-  forearmbend: ['LowerArm', 1],
-  lowerarm: ['LowerArm', 1],
-  loarm: ['LowerArm', 1],
-  lowarm: ['LowerArm', 1],
-  armlower: ['LowerArm', 1],
-  elbow: ['LowerArm', 0.9],
-  ulna: ['LowerArm', 0.7],
-  radius: ['LowerArm', 0.6],
-  hand: ['Hand', 1],
-  wrist: ['Hand', 0.9],
-  upleg: ['UpperLeg', 1],
-  upperleg: ['UpperLeg', 1],
-  legupper: ['UpperLeg', 1],
-  thigh: ['UpperLeg', 1],
-  thighbend: ['UpperLeg', 1],
-  femur: ['UpperLeg', 0.9],
-  hip: ['UpperLeg', 0.85],
-  lowerleg: ['LowerLeg', 1],
-  loleg: ['LowerLeg', 1],
-  lowleg: ['LowerLeg', 1],
-  leglower: ['LowerLeg', 1],
-  calf: ['LowerLeg', 1],
-  shin: ['LowerLeg', 1],
-  shinbend: ['LowerLeg', 1],
-  knee: ['LowerLeg', 0.9],
-  tibia: ['LowerLeg', 0.8],
-  foot: ['Foot', 1],
-  feet: ['Foot', 0.9],
-  ankle: ['Foot', 0.9],
-  toe: ['Toes', 1],
-  toes: ['Toes', 1],
-  toebase: ['Toes', 1],
-  ball: ['Toes', 0.9],
-  eye: ['Eye', 1],
-  eyeball: ['Eye', 0.9],
-  faceeye: ['Eye', 1],
-};
-
-const UPPER_LEG_KEYS = new Set(['upleg', 'upperleg', 'legupper', 'thigh', 'thighbend', 'femur', 'hip']);
-const LOWER_LEG_KEYS = new Set(['leg', 'lowerleg', 'loleg', 'lowleg', 'leglower', 'calf', 'shin', 'shinbend', 'knee', 'tibia']);
-
-const FINGER_NAMES: Record<string, 'Thumb' | 'Index' | 'Middle' | 'Ring' | 'Little'> = {
+const TORSO_TOKENS = new Set(['hips', 'hip', 'pelvis', 'abdomen', 'waist', 'torso', 'spine', 'chest', 'upperchest', 'lowerchest', 'neck', 'head']);
+const ARM_TOKENS = new Set([
+  'clavicle',
+  'clav',
+  'collar',
+  'collarbone',
+  'shoulder',
+  'shldr',
+  'arm',
+  'upperarm',
+  'humerus',
+  'bicep',
+  'biceps',
+  'forearm',
+  'elbow',
+  'lowerarm',
+  'ulna',
+  'wrist',
+  'hand',
+  'palm',
+]);
+const LEG_TOKENS = new Set([
+  'thigh',
+  'upleg',
+  'upperleg',
+  'femur',
+  'leg',
+  'knee',
+  'shin',
+  'calf',
+  'lowerleg',
+  'tibia',
+  'ankle',
+  'foot',
+  'toe',
+  'toes',
+  'toebase',
+  'ball',
+  'metatarsal',
+  'metatarsals',
+  'bigtoe',
+  'smalltoe',
+]);
+const FACE_TOKENS = new Set(['eye', 'eyes', 'eyeball', 'faceeye', 'jaw', 'lowerjaw', 'upperjaw', 'jawroot', 'chin', 'mandible', 'tongue', 'teeth', 'tooth', 'nose', 'mouth', 'brow', 'eyebrow', 'cheek', 'ear', 'ears', 'lip', 'lips', 'facial', 'face']);
+const FINGER_DIGITS: Record<string, FingerDigit> = {
   thumb: 'Thumb',
   index: 'Index',
   pointer: 'Index',
@@ -403,8 +312,7 @@ const FINGER_NAMES: Record<string, 'Thumb' | 'Index' | 'Middle' | 'Ring' | 'Litt
   pinkie: 'Little',
   little: 'Little',
 };
-const FINGER_FILLER = new Set(['hand', 'f', 'finger', 'fingers', 'digit']);
-const SEGMENT_WORDS: Record<string, 'Metacarpal' | 'Proximal' | 'Intermediate' | 'Distal' | 'tip'> = {
+const FINGER_SEGMENTS: Record<string, FingerSegment> = {
   metacarpal: 'Metacarpal',
   meta: 'Metacarpal',
   proximal: 'Proximal',
@@ -412,189 +320,185 @@ const SEGMENT_WORDS: Record<string, 'Metacarpal' | 'Proximal' | 'Intermediate' |
   intermediate: 'Intermediate',
   inter: 'Intermediate',
   medial: 'Intermediate',
-  middle: 'Intermediate',
   distal: 'Distal',
   dist: 'Distal',
-  tip: 'tip',
-  end: 'tip',
 };
+const STEM_DROP = new Set(['twist', 'roll', 'bend']);
 
-export interface FingerNameInfo {
-  finger: 'Thumb' | 'Index' | 'Middle' | 'Ring' | 'Little';
-  segment: 'Metacarpal' | 'Proximal' | 'Intermediate' | 'Distal' | 'tip' | null;
-  side: NameSide;
+/** Shoulder-rule keywords: `clavicle|collar` always make a shoulder. */
+export const CLAVICLE_TOKENS = new Set(['clavicle', 'clav', 'collar', 'collarbone']);
+/** Shoulder-rule keywords: a `shoulder` followed by one of these is a shoulder, not the upper arm. */
+export const UPPER_ARM_TOKENS = new Set(['arm', 'upperarm', 'humerus', 'shldr', 'bicep', 'biceps']);
+export const TOE_TOKENS = new Set(['toe', 'toes', 'toebase', 'ball', 'bigtoe']);
+export const HEAD_TOKENS = new Set(['head']);
+export const METACARPAL_TOKENS = new Set(['metacarpal', 'meta', 'palm']);
+
+function isNumeric(t: string): boolean {
+  return /^\d+$/.test(t);
+}
+
+const _cache = new Map<string, BoneNameInfo>();
+
+/** Name-only classification (no hierarchy context). Cached. */
+export function parseBoneName(name: string): BoneNameInfo {
+  const cached = _cache.get(name);
+  if (cached) return cached;
+  const { stripped, side: presetSide } = stripPrefix(name);
+  const { tokens, side } = tokenize(stripped, presetSide);
+  const info = classifyTokens(name, stripped, tokens, side);
+  _cache.set(name, info);
+  return info;
+}
+
+function classifyTokens(name: string, stripped: string, tokens: string[], side: NameSide): BoneNameInfo {
+  const numeric = tokens.filter(isNumeric);
+  const ordinal = numeric.length ? parseInt(numeric[numeric.length - 1], 10) : null;
+  const twist = tokens.includes('twist') || tokens.includes('roll');
+  const segment = numeric.some((t) => t.length === 3);
+  const stem = tokens.filter((t) => !isNumeric(t) && !STEM_DROP.has(t)).join('');
+  const markerToken = tokens.some((t) => MARKER_TOKENS.has(t));
+
+  let group: BoneGroup = 'unknown';
+  let keyword: string | null = null;
+  let finger: FingerInfo | null = null;
+
+  const ignored = VROID_IGNORE.test(name.trim()) || tokens.some((t) => IGNORE_TOKENS.has(t));
+  const hasTorso = tokens.find((t) => TORSO_TOKENS.has(t));
+  const hasArm = tokens.find((t) => ARM_TOKENS.has(t));
+  const hasLeg = tokens.find((t) => LEG_TOKENS.has(t));
+  const hasFace = tokens.find((t) => FACE_TOKENS.has(t));
+  const digitToken = tokens.find((t) => FINGER_DIGITS[t] !== undefined);
+
+  if (ignored) {
+    group = 'ignore';
+  } else if (markerToken) {
+    group = 'marker';
+  } else if (digitToken && fingerPlausible(digitToken, tokens, side, hasTorso, hasLeg)) {
+    group = 'finger';
+    keyword = digitToken;
+    const segWord = tokens.find((t) => FINGER_SEGMENTS[t] !== undefined);
+    const fingerOrdinal = ordinal !== null && ordinal >= 1 && ordinal <= 4 ? ordinal : null;
+    let seg: FingerSegment | null = segWord ? FINGER_SEGMENTS[segWord] : null;
+    const digit = FINGER_DIGITS[digitToken];
+    if (!seg && fingerOrdinal !== null) {
+      if (digit === 'Thumb') seg = fingerOrdinal === 1 ? 'Metacarpal' : fingerOrdinal === 2 ? 'Proximal' : fingerOrdinal === 3 ? 'Distal' : 'Tip';
+      else seg = fingerOrdinal === 1 ? 'Proximal' : fingerOrdinal === 2 ? 'Intermediate' : fingerOrdinal === 3 ? 'Distal' : 'Tip';
+    }
+    finger = { digit, segment: seg, ordinal: fingerOrdinal };
+  } else if (hasFace) {
+    group = 'face';
+    keyword = hasFace;
+  } else if (hasTorso && !((hasTorso === 'hip' || hasTorso === 'pelvis') && (side === 'left' || side === 'right'))) {
+    group = 'torso';
+    keyword = hasTorso;
+  } else if (hasArm) {
+    group = 'arm';
+    keyword = hasArm;
+  } else if (hasLeg) {
+    group = 'leg';
+    keyword = hasLeg;
+  } else if (hasTorso === 'hip' && (side === 'left' || side === 'right')) {
+    group = 'leg';
+    keyword = 'hip';
+  }
+
+  const cls = classOf(group, side);
+  return { raw: name, stripped, tokens, side, stem, ordinal, twist, segment, group, class: cls, keyword, finger, markerToken };
+}
+
+function fingerPlausible(digitToken: string, tokens: string[], side: NameSide, hasTorso: string | undefined, hasLeg: string | undefined): boolean {
+  if (hasLeg) return false; // "middle toe" etc.
+  if (digitToken === 'middle' || digitToken === 'ring' || digitToken === 'mid') {
+    if (hasTorso) return false;
+    const sided = side === 'left' || side === 'right';
+    const cue = tokens.some((t) => t === 'hand' || t === 'finger' || t === 'f' || isNumeric(t) || FINGER_SEGMENTS[t] !== undefined);
+    return sided || cue;
+  }
+  return true;
+}
+
+function classOf(group: BoneGroup, side: NameSide): BoneClass {
+  if (group === 'arm') return side === 'left' ? 'armL' : side === 'right' ? 'armR' : 'arm';
+  if (group === 'leg') return side === 'left' ? 'legL' : side === 'right' ? 'legR' : 'leg';
+  return group;
 }
 
 /**
- * Finger and segment carried by a bone name (`LeftHandThumb1`, `index_02_l`,
- * `DEF-f_ring.03.L`, `J_Bip_L_Little2`...). Digit convention: thumb 1/2/3 =
- * metacarpal/proximal/distal, other fingers 1/2/3 = proximal/intermediate/distal,
- * 4 = tip. Non-thumb fingers named `*_metacarpal` get segment `Metacarpal`
- * (no humanoid role).
+ * Full classification with hierarchy context: a tail marker must be a leaf
+ * with zero skin weight (a weighted `*_End` is a real bone); a Mixamo-style
+ * finger tip (`Thumb4`, `Index4`) with no children and no weight is a marker.
  */
-export function fingerNameInfo(name: string): FingerNameInfo | null {
-  const n = normalizeBoneName(name);
-  let finger: FingerNameInfo['finger'] | null = null;
-  let segment: FingerNameInfo['segment'] = null;
-  let digit: number | null = null;
-  for (const t of n.tokens) {
-    if (/^\d+$/.test(t)) {
-      digit = parseInt(t, 10);
-      continue;
-    }
-    if (finger === null && FINGER_NAMES[t]) {
-      finger = FINGER_NAMES[t];
-      continue;
-    }
-    if (finger !== null && SEGMENT_WORDS[t]) {
-      segment = SEGMENT_WORDS[t];
-      continue;
-    }
-    if (FINGER_FILLER.has(t)) continue;
-    // Any other token means this is not a plain finger bone (e.g. thumb_ik, ThumbTarget).
-    return null;
+export function classifyBone(name: string, node?: BoneNodeContext): BoneNameInfo {
+  const base = parseBoneName(name);
+  if (!node) return base;
+  const zeroWeight = !node.hasWeights || !(node.weight > 0);
+  if (base.group === 'marker') {
+    if (node.isLeaf && zeroWeight) return base;
+    // A weighted or non-leaf "end" bone is a real link: classify without the marker token.
+    const rest = base.tokens.filter((t) => !MARKER_TOKENS.has(t));
+    const re = classifyTokens(name, base.stripped, rest, base.side);
+    return { ...re, tokens: base.tokens, markerToken: true, group: re.group === 'marker' ? 'unknown' : re.group, class: re.group === 'marker' ? 'unknown' : re.class };
   }
-  if (finger === null) return null;
-  if (segment === null && digit !== null) {
-    if (finger === 'Thumb') segment = digit === 1 ? 'Metacarpal' : digit === 2 ? 'Proximal' : digit === 3 ? 'Distal' : 'tip';
-    else segment = digit === 1 ? 'Proximal' : digit === 2 ? 'Intermediate' : digit === 3 ? 'Distal' : 'tip';
+  if (base.group === 'finger' && base.finger && base.finger.ordinal === 4 && node.isLeaf && zeroWeight) {
+    return { ...base, group: 'marker', class: 'marker' };
   }
-  return { finger, segment, side: n.side };
-}
-
-export interface NameCandidate {
-  index: number;
-  score: number;
-}
-
-function sidePrefix(side: NameSide): 'left' | 'right' | null {
-  return side === 'left' || side === 'right' ? side : null;
+  return base;
 }
 
 /**
- * Per-role ranked candidate lists from names only. Sides must match; helper
- * bones are skipped; rig-family conventions are resolved with the light
- * structural rules from docs/DESIGN.md §5.4 (Mixamo `Leg` after `UpLeg` is a
- * lower leg, a side-qualified `hip` is an upper leg, `shoulder` is a clavicle
- * only when the same side also has an arm candidate).
+ * Segment/twist merge rule: `child` is a continuation of `parent` (skipped as
+ * an unmapped intermediate) when it carries a twist/roll token or a `.NNN`
+ * segment suffix, is sided, and its stem equals the parent's stem
+ * (`lShldrTwist` after `lShldrBend`, `DEF-upper_arm.L.001` after
+ * `DEF-upper_arm.L`). Torso chains (unsided) never merge: their links are
+ * ordinal by nature (`DEF-spine.001`, CC4 `NeckTwist02`).
  */
-export function scoreNameCandidates(graph: SkeletonGraph): Map<HumanoidBone, NameCandidate[]> {
-  const out = new Map<HumanoidBone, NameCandidate[]>();
-  const push = (role: HumanoidBone, index: number, score: number) => {
-    let list = out.get(role);
-    if (!list) {
-      list = [];
-      out.set(role, list);
-    }
-    const existing = list.find((c) => c.index === index);
-    if (existing) existing.score = Math.max(existing.score, score);
-    else list.push({ index, score });
-  };
-
-  const norms = graph.nodes.map((n) => normalizeBoneName(n.name));
-  const keys = norms.map(nameKey);
-  const helper = graph.nodes.map((n) => isHelperBone(n.name));
-
-  const sameSideAncestorHasKey = (index: number, keySet: Set<string>): boolean => {
-    const side = norms[index].side;
-    let p = graph.nodes[index].parent;
-    while (p >= 0) {
-      if (keySet.has(keys[p]) && norms[p].side === side && !helper[p]) return true;
-      p = graph.nodes[p].parent;
-    }
-    return false;
-  };
-  const sameSideDescendantHasKey = (index: number, keySet: Set<string>): boolean => {
-    const side = norms[index].side;
-    const stack = [...graph.nodes[index].children];
-    while (stack.length) {
-      const i = stack.pop()!;
-      if (keySet.has(keys[i]) && norms[i].side === side && !helper[i]) return true;
-      for (const c of graph.nodes[i].children) stack.push(c);
-    }
-    return false;
-  };
-
-  // Which sides carry an explicit arm candidate (for the shoulder rule).
-  const armSides = new Set<string>();
-  for (let i = 0; i < graph.nodes.length; i++) {
-    if (helper[i]) continue;
-    const s = sidePrefix(norms[i].side);
-    if (!s) continue;
-    const entry = SIDE_LEXICON[keys[i]];
-    if (entry && entry[0] === 'UpperArm') armSides.add(s);
-  }
-
-  for (let i = 0; i < graph.nodes.length; i++) {
-    if (helper[i]) continue;
-    const norm = norms[i];
-    const key = keys[i];
-    if (!key) continue;
-    const side = sidePrefix(norm.side);
-    const suffix = numericSuffix(norm);
-    const chainPenalty = suffix === null ? 0 : 0.01 * Math.min(suffix, 20);
-
-    // Fingers first: they carry finger tokens that would otherwise not match.
-    const finger = fingerNameInfo(graph.nodes[i].name);
-    if (finger && side) {
-      if (finger.segment && finger.segment !== 'tip') {
-        if (finger.finger === 'Thumb' && finger.segment === 'Intermediate') continue;
-        if (finger.finger !== 'Thumb' && finger.segment === 'Metacarpal') continue;
-        push(`${side}${finger.finger}${finger.segment}` as HumanoidBone, i, 1);
-      }
-      continue;
-    }
-
-    if (side === null) {
-      const center = CENTER_LEXICON[key];
-      if (center) {
-        let [role, score] = center;
-        if (role === 'hips') {
-          const kids = graph.nodes[i].children.length;
-          if (key === 'root' || key === 'cog') {
-            if (kids < 2) continue;
-            score += 0.2;
-          } else if (kids >= 2) score += 0.05;
-        }
-        push(role, i, score - chainPenalty);
-      }
-      continue;
-    }
-
-    // Side-qualified roles.
-    if (key === 'leg') {
-      if (sameSideAncestorHasKey(i, UPPER_LEG_KEYS)) push(`${side}LowerLeg`, i, 1 - chainPenalty);
-      else if (sameSideDescendantHasKey(i, LOWER_LEG_KEYS)) push(`${side}UpperLeg`, i, 0.9 - chainPenalty);
-      else push(`${side}LowerLeg`, i, 0.6 - chainPenalty);
-      continue;
-    }
-    const entry = SIDE_LEXICON[key];
-    if (!entry) continue;
-    let [role, score] = entry;
-    if (role === 'Shoulder' && !armSides.has(side)) {
-      // "shoulder" with no separate arm bone on this side is the upper arm itself.
-      role = 'UpperArm';
-      score = 0.8;
-    }
-    push(`${side}${role}` as HumanoidBone, i, score - chainPenalty);
-  }
-
-  for (const list of out.values()) list.sort((a, b) => b.score - a.score || a.index - b.index);
-  return out;
+export function isSegmentOf(child: BoneNameInfo, parent: BoneNameInfo): boolean {
+  if (!(child.twist || child.segment)) return false;
+  if (child.side !== 'left' && child.side !== 'right') return false;
+  if (parent.side !== child.side) return false;
+  if (!child.stem || child.stem !== parent.stem) return false;
+  return true;
 }
 
-/** Rig family guess from raw bone names (docs/DESIGN.md §5.5 presets). */
-export function detectFamilyFromNames(names: string[]): 'mixamo' | 'meshy' | 'vrm' | 'rigify' | 'ue' | 'cc' | 'daz' | 'blender' | 'unknown' {
+/** Normalized bone name for hashing: stripped, lower-case, separators removed. */
+export function normalizedName(name: string): string {
+  return stripPrefix(name).stripped.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+// ---------------------------------------------------------------------------
+// Rig family
+// ---------------------------------------------------------------------------
+
+export interface FamilyHints {
+  /** glTF `asset.generator` string when known. */
+  generator?: string;
+  /** Mesh node names (the bundled pack uses `part_*` / `cap_*` meshes). */
+  meshNames?: readonly string[];
+  /** The file was a VRM. */
+  vrm?: boolean;
+}
+
+/** Rig family guess from raw bone names and loader hints (docs/DESIGN.md §5.4). */
+export function detectFamily(names: readonly string[], hints: FamilyHints = {}): RigFamily {
   const set = new Set(names);
   const has = (re: RegExp) => names.some((n) => re.test(n));
-  if (has(/^mixamorig\d*:/i)) return 'mixamo';
-  if (has(/^J_Bip_/)) return 'vrm';
+  if (hints.vrm || has(/^J_Bip_/)) return 'vrm';
+  if (has(/^mixamorig\d*:?[A-Z]/i)) return 'mixamo';
   if (has(/^DEF-/)) return 'rigify';
   if (has(/^CC_Base_/i)) return 'cc';
-  if (set.has('pelvis') && (set.has('spine_01') || set.has('spine_02'))) return 'ue';
-  if (set.has('abdomenLower') || set.has('lShldrBend') || set.has('rShldrBend')) return 'daz';
-  if (set.has('Spine02') && (set.has('neck') || set.has('head_end') || set.has('Spine01'))) return 'meshy';
+  if (set.has('pelvis') && (set.has('spine_01') || set.has('spine_02')) && (set.has('thigh_l') || set.has('upperarm_l'))) return 'ue';
+  if (set.has('abdomenLower') || set.has('lShldrBend') || set.has('rShldrBend') || has(/^Genesis\d/)) return 'daz';
+  if (set.has('pelvis') && (set.has('left_hip') || set.has('right_hip')) && (set.has('left_knee') || set.has('left_collar') || set.has('left_shoulder'))) return 'smpl';
+  const meshySpine = set.has('Spine02') && set.has('Spine') && set.has('Hips');
+  if (meshySpine) {
+    const gen = hints.generator ?? '';
+    const packGenerator = /compress_glb|game-parts/i.test(gen);
+    const packMeshes = (hints.meshNames ?? []).some((m) => /^(part|cap)_/.test(m) || m === 'char1');
+    if (packGenerator || packMeshes) return 'game-parts';
+    return 'meshy';
+  }
   if (set.has('Hips') && set.has('Spine') && set.has('LeftArm') && set.has('LeftForeArm')) return 'mixamo';
-  if (has(/^(spine|upper_arm|forearm|thigh|shin)(\.\d{3})?(\.[LR])?$/)) return 'blender';
+  if (has(/^(spine|upper_arm|forearm|thigh|shin|shoulder|hand|foot)(\.\d{3})?(\.[LR])?$/)) return 'blender';
   return 'unknown';
 }

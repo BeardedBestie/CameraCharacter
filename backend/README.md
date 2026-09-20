@@ -31,8 +31,11 @@ carry raw MediaPipe coordinates and the browser does the conversion.
 Verify the installation without a camera:
 
 ```bash
-python backend/selftest.py            # downloads the lite model, runs one inference, checks the JSON schema
+python backend/selftest.py            # downloads the lite model, runs two inferences, checks the JSON schema
 ```
+
+On a headless Linux box the MediaPipe wheel still needs the EGL/GLES runtime libraries
+(see the notes below); the self-test fails at "create PoseLandmarker" until they are installed.
 
 ## Flags
 
@@ -48,31 +51,45 @@ python backend/selftest.py            # downloads the lite model, runs one infer
 | `--max-fps` | `0` (camera rate) | throttle inference; the camera is still drained so frames stay fresh |
 | `--model-dir` | `backend/models` | where `.task` models are cached |
 
-Stop with Ctrl-C (or `q` in the preview window); the camera and the landmarker are released
-cleanly. `--preview` needs a GUI-enabled OpenCV build (`opencv-python`, which
-`requirements.txt` installs); with `opencv-python-headless` the script refuses to start
-in preview mode and tells you why.
+Stop with Ctrl-C / SIGTERM (or `q` in the preview window); the camera and the landmarker
+are released cleanly, connected clients get a WebSocket close (1001 going away), and the
+process exits 0. It exits 1 when the camera cannot be opened, stops delivering frames, the
+model download fails or the port is already in use (the reason is printed to stderr). A
+video file given as `--camera` ends the process with exit 0 at its last frame.
+
+`--preview` needs a GUI-enabled OpenCV build (`opencv-python`, which `requirements.txt`
+installs); with `opencv-python-headless` the script refuses to start in preview mode and
+tells you why.
 
 ## Protocol
 
 Each WebSocket text message is one PoseFrame v2 (see [`example_frame.json`](example_frame.json)):
 
 ```json
-{"v":2,"t":12345.678,"src":"python-opencv","size":[1280,720],
+{"v":2,"t":12345,"now":98765.4321,"src":"python-opencv","size":[1280,720],
  "pose":{"world":[[x,y,z,visibility]×33],"image":[[x,y,z,visibility]×33]}}
 ```
 
-* `t` is milliseconds, monotonic since the provider started (also the timestamp handed to
-  `detect_for_video`, so it strictly increases).
+* `t` is an integer millisecond timestamp, monotonic and strictly increasing since the
+  provider started (it is the exact `timestamp_ms` handed to `detect_for_video`).
+* `now` is the provider's performance counter at capture in ms (`time.perf_counter()`).
+  It is optional in the protocol; the browser re-stamps `now` with its own
+  `performance.now()` on receipt because the two clocks are not comparable, so this value
+  only documents the provider's own capture timing.
 * `world` landmarks are meters with the origin at the hip midpoint; `image` landmarks are
   normalized `[0,1]` image coordinates. Both use raw MediaPipe axes (x right, y down, z toward
   the camera negative). Landmark order is MediaPipe's 33-point BlazePose topology.
 * `pose` is `null` when nobody is detected. `hands` and `face` are not sent by this provider.
-* Floats are rounded to 5 decimals; a full frame is about 1.7 KB.
+* Floats are rounded to 5 decimals (`-0.0` becomes `0`); a full frame is about 1.7 KB. A
+  landmark with a non-finite coordinate is sent as `[0,0,0,0]` (invisible), never as NaN.
 
 A newly connected client immediately receives the last frame (if any) and then live frames.
-Frames are broadcast without waiting: a client whose socket buffer is full simply misses
-frames instead of building up latency for everyone.
+Frames are fanned out without ever awaiting a client. `websockets`' `broadcast()` has no
+backpressure of its own, so the provider checks each client's transport write buffer before
+every frame: a client with more than 16 KB of unsent data (its socket is saturated) skips
+that frame and catches up with the next one instead of building up latency. Skipped frames
+are counted in the periodic `[status]` line as `dropped`. Dead clients are reaped by
+WebSocket pings (10 s interval, 10 s timeout).
 
 ## Model variants and performance
 
@@ -90,10 +107,13 @@ Notes:
 * Capture resolution mostly affects the person detector's ability to find small/distant
   subjects; the landmark model always works on a crop. 640×480 is fine for close framing,
   1280×720 for full-body at 2–3 m.
-* Lower webcam exposure/auto-gain latency in your camera settings if motion feels late; the
-  provider itself adds under a millisecond on top of inference.
-* On Linux the MediaPipe wheel links against `libEGL.so.1` and `libGLESv2.so.2` even for
-  CPU inference. On a minimal server image install them with `apt-get install libegl1 libgles2`.
+* Lower webcam exposure/auto-gain latency in your camera settings if motion feels late; on
+  top of inference the provider only adds the BGR→RGB conversion and JSON encoding.
+* On Linux the MediaPipe wheel (`mediapipe/tasks/c/libmediapipe.so`) links against
+  `libEGL.so.1` and `libGLESv2.so.2` even for CPU inference, so importing it fails on a
+  minimal server or container image with `ImportError: libEGL.so.1: cannot open shared object
+  file`. Install the runtime libraries with `apt-get install libegl1 libgles2` (Debian/Ubuntu;
+  no GPU or display is needed).
 * The preview window is drawn from the capture thread. That is fine on Linux and Windows;
   on macOS OpenCV windows must run on the main thread, so use the browser overlay there
   instead of `--preview`.
@@ -101,8 +121,10 @@ Notes:
 ## Files
 
 * `stream_pose.py` — the provider (also importable: `ensure_model`, `create_landmarker`,
-  `detect`, `encode_frame`, `frame_to_json`, `validate_pose_frame`, `draw_skeleton`).
-* `selftest.py` — offline verification of download, landmarker, inference and the JSON schema.
+  `detect`, `encode_frame`, `frame_to_json`, `validate_pose_frame`, `draw_skeleton`,
+  `Broadcaster`, `PoseWorker`).
+* `selftest.py` — offline verification of download, landmarker, inference, the JSON schema
+  and the slow-client policy.
 * `example_frame.json` — one PoseFrame v2 with the exact shape the browser expects.
 * `requirements.txt` — Python dependencies.
 * `models/` — downloaded `.task` models (git-ignored).

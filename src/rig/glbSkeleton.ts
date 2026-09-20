@@ -1,19 +1,20 @@
 /**
- * Minimal, Node-safe GLB reader that reconstructs a rig's node hierarchy and
- * bind pose without WebGL, images or materials. Used by the unit tests on
- * `public/models/sample-meshy.glb` and usable anywhere a skeleton-only view of
- * a GLB is enough (e.g. profile precomputation in a script).
+ * Minimal, Node-safe GLB reader that reconstructs a rig's node hierarchy,
+ * bind pose, skin weights and bind-space mesh extents without WebGL, images or
+ * materials. Used by the unit tests on the bundled models and usable anywhere
+ * a skeleton-only view of a GLB is enough (profile precomputation scripts).
  *
- * Bind pose: for every skin joint the world matrix is `inverse(IBM)`. Per the
- * glTF specification the skinned mesh node's own transform is ignored for
- * skinning (vertices live in the skin's bind space, which is scene space), so
- * the inverse bind matrices directly give scene-space joint transforms; this
- * matches three.js' GLTFLoader, which binds skinned meshes with an identity
- * bind matrix.
+ * Bind pose: exactly {@link applyBindPose}: for every skin joint the bind
+ * world matrix is `inverse(IBM)` composed against the parent's bind world (a
+ * joint) or the parent's file transform (a non-joint), parents first. Per the
+ * glTF specification a skinned mesh node's own transform is ignored for
+ * skinning (three's GLTFLoader binds with the identity matrix), so the inverse
+ * bind matrices directly give scene-space joint transforms and skinned
+ * geometry bounds are already in bind space.
  */
 import { Bone, Box3, Matrix4, Object3D, Quaternion, Vector3 } from 'three';
 import type { Vec3Tuple } from '../core/types';
-import { buildGraphFromObject3D, type SkeletonGraph } from './skeletonGraph';
+import { buildGraphFromObject3D, groupSkins, type SkeletonGraph } from './skeletonGraph';
 
 interface GltfNode {
   name?: string;
@@ -41,7 +42,7 @@ interface GltfBufferView {
   byteLength: number;
   byteStride?: number;
 }
-interface GltfJson {
+export interface GltfJson {
   scene?: number;
   scenes?: { name?: string; nodes?: number[] }[];
   nodes?: GltfNode[];
@@ -56,12 +57,20 @@ export interface GlbSkeletonResult {
   /** Container holding the scene's root nodes; joints are `Bone`s, other nodes plain `Object3D`s. */
   root: Object3D;
   graph: SkeletonGraph;
-  /** Bind-pose mesh extent along +Y (glTF's up axis), when any mesh has bounds. */
+  /** Summed skin weight per joint object. */
+  weights: Map<Object3D, number>;
+  /** Joints of the primary skeleton group. */
+  joints: Set<Object3D>;
+  /** Bind-pose mesh extent along +Y, when any mesh has bounds. */
   meshHeight?: number;
-  /** Bind-pose axis-aligned bounds of all meshes in scene space. */
+  /** Bind-space axis-aligned bounds of all meshes (skinned: bind space; static: node transforms). */
   meshBounds?: { min: Vec3Tuple; max: Vec3Tuple };
-  /** The parsed glTF JSON (for callers that need extras/asset info). */
-  json: unknown;
+  /** Names of mesh nodes (family hints). */
+  meshNames: string[];
+  skinnedMeshCount: number;
+  generator?: string;
+  json: GltfJson;
+  warnings: string[];
 }
 
 const GLB_MAGIC = 0x46546c67;
@@ -102,25 +111,43 @@ export function parseGlbChunks(bytes: ArrayBuffer | Uint8Array): { json: GltfJso
   return { json, bin };
 }
 
-function readFloatAccessor(json: GltfJson, bin: Uint8Array | null, index: number): Float32Array {
+/** Reads any numeric accessor as plain numbers (normalized integers are denormalized). */
+function readAccessor(json: GltfJson, bin: Uint8Array | null, index: number): { data: Float64Array; n: number; count: number } {
   const acc = json.accessors?.[index];
   if (!acc) throw new Error(`Accessor ${index} missing.`);
-  if (acc.componentType !== 5126) throw new Error(`Accessor ${index} is not float32.`);
   const n = TYPE_SIZE[acc.type];
-  const out = new Float32Array(acc.count * n);
-  if (acc.bufferView === undefined || !bin) return out; // all zeros per spec when no bufferView
+  const compSize = COMPONENT_SIZE[acc.componentType];
+  if (!n || !compSize) throw new Error(`Accessor ${index} has an unsupported type.`);
+  const data = new Float64Array(acc.count * n);
+  if (acc.bufferView === undefined || !bin) return { data, n, count: acc.count }; // all zeros per spec
   const bv = json.bufferViews?.[acc.bufferView];
   if (!bv) throw new Error(`BufferView ${acc.bufferView} missing.`);
   if (bv.buffer !== 0) throw new Error('Only the embedded GLB buffer is supported.');
-  const elemBytes = n * COMPONENT_SIZE[acc.componentType];
+  const elemBytes = n * compSize;
   const stride = bv.byteStride ?? elemBytes;
   const base = bin.byteOffset + (bv.byteOffset ?? 0) + (acc.byteOffset ?? 0);
   const dv = new DataView(bin.buffer, 0, bin.buffer.byteLength);
+  const read = (at: number): number => {
+    switch (acc.componentType) {
+      case 5120:
+        return acc.normalized ? Math.max(dv.getInt8(at) / 127, -1) : dv.getInt8(at);
+      case 5121:
+        return acc.normalized ? dv.getUint8(at) / 255 : dv.getUint8(at);
+      case 5122:
+        return acc.normalized ? Math.max(dv.getInt16(at, true) / 32767, -1) : dv.getInt16(at, true);
+      case 5123:
+        return acc.normalized ? dv.getUint16(at, true) / 65535 : dv.getUint16(at, true);
+      case 5125:
+        return dv.getUint32(at, true);
+      default:
+        return dv.getFloat32(at, true);
+    }
+  };
   for (let i = 0; i < acc.count; i++) {
     const at = base + i * stride;
-    for (let k = 0; k < n; k++) out[i * n + k] = dv.getFloat32(at + k * 4, true);
+    for (let k = 0; k < n; k++) data[i * n + k] = read(at + k * compSize);
   }
-  return out;
+  return { data, n, count: acc.count };
 }
 
 function nodeLocalMatrix(node: GltfNode, out = new Matrix4()): Matrix4 {
@@ -133,18 +160,20 @@ function nodeLocalMatrix(node: GltfNode, out = new Matrix4()): Matrix4 {
 
 /**
  * Reads a GLB's node hierarchy, puts skinned joints into their bind pose and
- * returns the reconstructed `Object3D` tree, the {@link SkeletonGraph} and the
- * bind-pose mesh bounds.
+ * returns the reconstructed `Object3D` tree, the {@link SkeletonGraph} with
+ * skin weights, and the bind-pose mesh bounds.
  */
 export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonResult {
   const { json, bin } = parseGlbChunks(bytes);
+  const warnings: string[] = [];
   const nodes = json.nodes ?? [];
-  const joints = new Set<number>();
-  for (const skin of json.skins ?? []) for (const j of skin.joints) joints.add(j);
+  const skins = json.skins ?? [];
+  const jointSet = new Set<number>();
+  for (const skin of skins) for (const j of skin.joints) jointSet.add(j);
 
   const objects: Object3D[] = nodes.map((n, i) => {
-    const obj = joints.has(i) ? new Bone() : new Object3D();
-    obj.name = n.name ?? (joints.has(i) ? `joint_${i}` : `node_${i}`);
+    const obj = jointSet.has(i) ? new Bone() : new Object3D();
+    obj.name = n.name ?? (jointSet.has(i) ? `joint_${i}` : `node_${i}`);
     nodeLocalMatrix(n).decompose(obj.position, obj.quaternion, obj.scale);
     obj.updateMatrix();
     return obj;
@@ -164,22 +193,26 @@ export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonRes
   for (const i of sceneRoots) if (!hasParent.has(i)) root.add(objects[i]);
   root.updateMatrixWorld(true);
 
-  // Original world matrices (for non-skinned mesh bounds).
+  // Original world matrices (for static mesh bounds).
   const originalWorld = objects.map((o) => o.matrixWorld.clone());
 
-  // Bind pose from inverse bind matrices.
+  // Bind pose from inverse bind matrices (same procedure as applyBindPose).
   const targets = new Map<Object3D, Matrix4>();
-  for (const skin of json.skins ?? []) {
-    if (skin.inverseBindMatrices === undefined) {
-      // No IBMs: identity, i.e. the node transforms are the bind pose already.
-      continue;
-    }
-    const ibm = readFloatAccessor(json, bin, skin.inverseBindMatrices);
+  for (const skin of skins) {
+    if (skin.inverseBindMatrices === undefined) continue; // identity IBMs: node transforms are the bind pose
+    const { data } = readAccessor(json, bin, skin.inverseBindMatrices);
     skin.joints.forEach((j, k) => {
       const obj = objects[j];
-      if (!obj || targets.has(obj)) return;
-      const world = new Matrix4().fromArray(ibm, k * 16).invert();
+      if (!obj) return;
+      const world = new Matrix4().fromArray(Array.from(data.subarray(k * 16, k * 16 + 16))).invert();
       if (!Number.isFinite(world.elements[0])) return;
+      const prev = targets.get(obj);
+      if (prev) {
+        let d = 0;
+        for (let e = 0; e < 16; e++) d = Math.max(d, Math.abs(prev.elements[e] - world.elements[e]));
+        if (d > 1e-3) warnings.push(`Joint '${obj.name}' is shared by several skins whose inverse bind matrices disagree (max diff ${d.toExponential(1)}); keeping the first.`);
+        return;
+      }
       targets.set(obj, world);
     });
   }
@@ -188,13 +221,22 @@ export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonRes
     root.traverse((o) => {
       if (targets.has(o)) ordered.push(o);
     });
+    const worldCache = new Map<Object3D, Matrix4>();
+    const worldOf = (obj: Object3D): Matrix4 => {
+      const t = targets.get(obj);
+      if (t) return t;
+      const c = worldCache.get(obj);
+      if (c) return c;
+      const m = obj === root || !obj.parent ? obj.matrixWorld.clone() : new Matrix4().multiplyMatrices(worldOf(obj.parent), obj.matrix);
+      worldCache.set(obj, m);
+      return m;
+    };
     const local = new Matrix4();
     const parentInv = new Matrix4();
     for (const obj of ordered) {
       const world = targets.get(obj)!;
-      const parent = obj.parent;
-      if (parent) {
-        parentInv.copy(targets.get(parent) ?? parent.matrixWorld).invert();
+      if (obj.parent) {
+        parentInv.copy(worldOf(obj.parent)).invert();
         local.multiplyMatrices(parentInv, world);
       } else local.copy(world);
       local.decompose(obj.position, obj.quaternion, obj.scale);
@@ -203,7 +245,57 @@ export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonRes
     root.updateMatrixWorld(true);
   }
 
-  // Mesh bounds in bind space.
+  // Skin weights per joint (JOINTS_n / WEIGHTS_n over every skinned mesh node).
+  const weights = new Map<Object3D, number>();
+  for (const skin of skins) for (const j of skin.joints) if (objects[j]) weights.set(objects[j], weights.get(objects[j]) ?? 0);
+  const meshNames: string[] = [];
+  let skinnedMeshCount = 0;
+  const seenMeshSkin = new Set<string>();
+  nodes.forEach((n) => {
+    if (n.mesh === undefined) return;
+    const mesh = json.meshes?.[n.mesh];
+    if (!mesh) return;
+    if (n.name) meshNames.push(n.name);
+    if (n.skin === undefined) return;
+    skinnedMeshCount++;
+    const key = `${n.mesh}|${n.skin}`;
+    if (seenMeshSkin.has(key)) return;
+    seenMeshSkin.add(key);
+    const skin = skins[n.skin];
+    if (!skin) return;
+    for (const prim of mesh.primitives) {
+      for (let set = 0; ; set++) {
+        const ji = prim.attributes?.[`JOINTS_${set}`];
+        const wi = prim.attributes?.[`WEIGHTS_${set}`];
+        if (ji === undefined || wi === undefined) break;
+        const J = readAccessor(json, bin, ji);
+        const W = readAccessor(json, bin, wi);
+        const count = Math.min(J.count, W.count);
+        const comps = Math.min(J.n, W.n);
+        for (let v = 0; v < count; v++) {
+          for (let k = 0; k < comps; k++) {
+            const w = W.data[v * W.n + k];
+            if (!(w > 0)) continue;
+            const jointNode = skin.joints[J.data[v * J.n + k]];
+            const obj = jointNode !== undefined ? objects[jointNode] : undefined;
+            if (!obj) continue;
+            weights.set(obj, (weights.get(obj) ?? 0) + w);
+          }
+        }
+      }
+    }
+  });
+  const groups = groupSkins(
+    skins.map((s) => ({ joints: s.joints.map((j) => objects[j]).filter((o): o is Object3D => !!o) })),
+    weights,
+  );
+  const joints = groups.length ? groups[0].joints : new Set<Object3D>();
+  for (let g = 1; g < groups.length; g++) {
+    const sample = [...groups[g].joints].slice(0, 3).map((j) => `'${j.name}'`).join(', ');
+    warnings.push(`Secondary skeleton ignored (${groups[g].joints.size} joints, weight ${groups[g].weight.toFixed(1)}; e.g. ${sample}).`);
+  }
+
+  // Mesh bounds: bind space for skinned meshes (identity), node transforms for static meshes.
   const box = new Box3();
   let any = false;
   const corner = new Vector3();
@@ -220,11 +312,10 @@ export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonRes
       let min = acc.min;
       let max = acc.max;
       if (!min || !max || min.length < 3 || max.length < 3) {
-        if (acc.componentType !== 5126) continue;
-        const data = readFloatAccessor(json, bin, pi);
+        const { data, n: comps } = readAccessor(json, bin, pi);
         min = [Infinity, Infinity, Infinity];
         max = [-Infinity, -Infinity, -Infinity];
-        for (let v = 0; v < data.length; v += 3) {
+        for (let v = 0; v < data.length; v += comps) {
           for (let k = 0; k < 3; k++) {
             if (data[v + k] < min[k]) min[k] = data[v + k];
             if (data[v + k] > max[k]) max[k] = data[v + k];
@@ -241,11 +332,14 @@ export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonRes
     }
   });
 
-  const result: GlbSkeletonResult = { root, graph: buildGraphFromObject3D(root), json };
+  const graph = buildGraphFromObject3D(root, { joints, weights, skinnedMeshCount, warnings });
+  const result: GlbSkeletonResult = { root, graph, weights, joints, meshNames, skinnedMeshCount, generator: json.asset?.generator, json, warnings: graph.warnings };
   if (any) {
     result.meshBounds = { min: [box.min.x, box.min.y, box.min.z], max: [box.max.x, box.max.y, box.max.z] };
     result.meshHeight = box.max.y - box.min.y;
     root.userData.bindBounds = result.meshBounds;
   }
+  root.userData.generator = json.asset?.generator;
+  root.userData.meshNames = meshNames;
   return result;
 }
