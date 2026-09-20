@@ -2,3 +2,4 @@ mediapipe>=1.0.1
 opencv-python>=4.10
 websockets>=14
 numpy>=1.26
+certifi>=2024.2.2

@@ -82,6 +82,8 @@ export interface LoadModelOptions {
   useCache?: boolean;
   /** Progress callback with the step being attempted. */
   onProgress?: (step: 'local' | 'cache' | 'remote', name: ModelAssetName) => void;
+  /** Diagnostic lines (which location answered, with what). */
+  log?: (message: string) => void;
 }
 
 function defaultFetch(): FetchLike {
@@ -116,16 +118,38 @@ export function looksLikeTaskBundle(contentType: string | null, bytes: Uint8Arra
   return bytes.length >= MIN_TASK_BYTES;
 }
 
-async function fetchBytes(fetchImpl: FetchLike, url: string): Promise<Uint8Array | null> {
+/**
+ * The first bytes of a body for diagnostics: the text itself when it is
+ * printable (an HTML block page, a JSON error), otherwise hex.
+ */
+export function previewBytes(bytes: Uint8Array, chars = 80): string {
+  const head = bytes.subarray(0, chars);
+  const printable = head.length > 0 && head.every((b) => b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b < 0x7f));
+  if (printable) return JSON.stringify(new TextDecoder().decode(head).replace(/\s+/g, ' ').trim());
+  return Array.from(bytes.subarray(0, 8), (b) => b.toString(16).padStart(2, '0')).join(' ');
+}
+
+/** "HTTP 200, text/html, 1532 bytes, starts with ..." for error messages and logs. */
+export function describeBody(res: Pick<Response, 'status' | 'headers'>, bytes: Uint8Array): string {
+  const type = res.headers.get('content-type') ?? 'no content-type';
+  return `HTTP ${res.status}, ${type}, ${bytes.length} bytes, starts with ${previewBytes(bytes)}`;
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function fetchBytes(fetchImpl: FetchLike, url: string): Promise<{ bytes: Uint8Array | null; reason: string }> {
   let res: Response;
   try {
     res = await fetchImpl(url, { cache: 'default' });
-  } catch {
-    return null;
+  } catch (err) {
+    return { bytes: null, reason: `network error: ${errorText(err)}` };
   }
-  if (!res.ok) return null;
+  if (!res.ok) return { bytes: null, reason: `HTTP ${res.status}` };
   const buf = new Uint8Array(await res.arrayBuffer());
-  return looksLikeTaskBundle(res.headers.get('content-type'), buf) ? buf : null;
+  if (looksLikeTaskBundle(res.headers.get('content-type'), buf)) return { bytes: buf, reason: '' };
+  return { bytes: null, reason: `not a task bundle (${describeBody(res, buf)})` };
 }
 
 async function openCache(): Promise<Cache | null> {
@@ -146,10 +170,17 @@ export async function loadModelAsset(name: ModelAssetName, options: LoadModelOpt
   if (!asset) throw new Error(`Unknown model asset "${String(name)}"`);
   const fetchImpl = options.fetch ?? defaultFetch();
   const useCache = options.useCache ?? true;
+  const say = options.log ?? (() => {});
+  const tag = `model ${asset.basename}`;
 
   options.onProgress?.('local', name);
-  const local = await fetchBytes(fetchImpl, localModelUrl(name));
-  if (local) return local;
+  const localUrl = localModelUrl(name);
+  const local = await fetchBytes(fetchImpl, localUrl);
+  if (local.bytes) {
+    say(`${tag}: self-hosted copy at ${localUrl} (${local.bytes.length} bytes)`);
+    return local.bytes;
+  }
+  say(`${tag}: no self-hosted copy at ${localUrl} (${local.reason})`);
 
   const cache = useCache ? await openCache() : null;
   if (cache) {
@@ -158,7 +189,11 @@ export async function loadModelAsset(name: ModelAssetName, options: LoadModelOpt
       const hit = await cache.match(asset.url);
       if (hit && hit.ok) {
         const buf = new Uint8Array(await hit.arrayBuffer());
-        if (looksLikeTaskBundle(hit.headers.get('content-type'), buf)) return buf;
+        if (looksLikeTaskBundle(hit.headers.get('content-type'), buf)) {
+          say(`${tag}: served from the browser cache (${buf.length} bytes)`);
+          return buf;
+        }
+        say(`${tag}: cached entry unusable, re-downloading`);
       }
     } catch {
       // A broken cache entry is not fatal; fall through to the network.
@@ -166,17 +201,24 @@ export async function loadModelAsset(name: ModelAssetName, options: LoadModelOpt
   }
 
   options.onProgress?.('remote', name);
+  say(`${tag}: downloading ${asset.url}`);
+  const started = Date.now();
   let res: Response;
   try {
     res = await fetchImpl(asset.url);
   } catch (err) {
-    throw new Error(`Failed to download ${asset.basename}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`Failed to download ${asset.basename} from ${asset.url}: ${errorText(err)}`);
   }
-  if (!res.ok) throw new Error(`Failed to download ${asset.basename}: HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`Failed to download ${asset.basename}: HTTP ${res.status} from ${asset.url}`);
   const bytes = new Uint8Array(await res.arrayBuffer());
   if (!looksLikeTaskBundle(res.headers.get('content-type'), bytes)) {
-    throw new Error(`Downloaded ${asset.basename} is not a MediaPipe task bundle`);
+    throw new Error(
+      `Downloaded ${asset.basename} from ${asset.url} is not a MediaPipe task bundle (${describeBody(res, bytes)}). ` +
+        'Something between this browser and Google\'s storage answered instead of the file (proxy, content filter, captive portal); ' +
+        'see README "Troubleshooting a start-up problem" for self-hosting the models.',
+    );
   }
+  say(`${tag}: downloaded ${bytes.length} bytes in ${Date.now() - started} ms`);
   if (cache) {
     try {
       const headers = new Headers({ 'content-type': 'application/octet-stream' });
@@ -192,22 +234,33 @@ export async function loadModelAsset(name: ModelAssetName, options: LoadModelOpt
  * Resolve the base path for `FilesetResolver.forVisionTasks`: the local copy
  * when `/mediapipe/wasm/vision_wasm_internal.js` is reachable, else the CDN.
  */
-export async function resolveWasmBasePath(fetchImpl: FetchLike = defaultFetch()): Promise<string> {
+export async function resolveWasmBasePath(fetchImpl: FetchLike = defaultFetch(), log?: (message: string) => void): Promise<string> {
   const probe = `${LOCAL_WASM_PATH}/${WASM_PROBE_FILE}`;
   const ok = (res: Response) => {
     if (!res.ok) return false;
     const ct = res.headers.get('content-type');
     return !(ct && /text\/html/i.test(ct));
   };
+  let reason = '';
   try {
     const head = await fetchImpl(probe, { method: 'HEAD' });
-    if (ok(head)) return LOCAL_WASM_PATH;
+    if (ok(head)) {
+      log?.(`MediaPipe WASM runtime: local copy at ${LOCAL_WASM_PATH}`);
+      return LOCAL_WASM_PATH;
+    }
     if (head.status === 405 || head.status === 501) {
       const get = await fetchImpl(probe, { method: 'GET' });
-      if (ok(get)) return LOCAL_WASM_PATH;
+      if (ok(get)) {
+        log?.(`MediaPipe WASM runtime: local copy at ${LOCAL_WASM_PATH}`);
+        return LOCAL_WASM_PATH;
+      }
+      reason = `HTTP ${get.status} ${get.headers.get('content-type') ?? ''}`.trim();
+    } else {
+      reason = `HTTP ${head.status} ${head.headers.get('content-type') ?? ''}`.trim();
     }
-  } catch {
-    // fall through to the CDN
+  } catch (err) {
+    reason = errorText(err);
   }
+  log?.(`MediaPipe WASM runtime: no local copy at ${probe} (${reason}); using the CDN ${CDN_WASM_PATH}`);
   return CDN_WASM_PATH;
 }

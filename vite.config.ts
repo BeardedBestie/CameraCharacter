@@ -2,6 +2,7 @@ import { defineConfig } from 'vitest/config';
 import type { Plugin } from 'vite';
 import { cpSync, existsSync, mkdirSync, statSync, createReadStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { execSync } from 'node:child_process';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -92,8 +93,27 @@ function serveSampleModels(): Plugin {
   };
 }
 
+/** Commit and branch for the boot banner (src/core/log.ts); "unknown" without git. */
+function gitInfo(): { commit: string; branch: string } {
+  const run = (cmd: string): string => {
+    try {
+      return execSync(cmd, { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() || 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  };
+  return { commit: run('git rev-parse --short HEAD'), branch: run('git rev-parse --abbrev-ref HEAD') };
+}
+
+const git = gitInfo();
+
 export default defineConfig({
   plugins: [copyMediaPipeWasm(), mediaPipeSourceMap(), serveSampleModels()],
+  define: {
+    __APP_COMMIT__: JSON.stringify(git.commit),
+    __APP_BRANCH__: JSON.stringify(git.branch),
+    __APP_BUILD_TIME__: JSON.stringify(new Date().toISOString()),
+  },
   server: {
     port: 5173,
     strictPort: false,

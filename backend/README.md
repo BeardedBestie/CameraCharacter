@@ -50,6 +50,19 @@ On a headless Linux box the MediaPipe wheel still needs the EGL/GLES runtime lib
 | `--mirror-preview` | off | flip only the preview window (the streamed landmarks are never flipped) |
 | `--max-fps` | `0` (camera rate) | throttle inference; the camera is still drained so frames stay fresh |
 | `--model-dir` | `backend/models` | where `.task` models are cached |
+| `--insecure` | off | skip TLS certificate verification for the model download only (see below) |
+
+### TLS errors on the model download
+
+`model download failed: ... [SSL: CERTIFICATE_VERIFY_FAILED] ... unable to get local issuer
+certificate` means Python could not verify Google's certificate with its own trust store. That
+is common with the python.org installer on macOS (its Python ships without root certificates
+until you run **Install Certificates.command** in `/Applications/Python 3.x/`) and behind a
+corporate proxy that re-signs TLS. `requirements.txt` installs `certifi`, whose CA bundle the
+script uses automatically; alternatively set `SSL_CERT_FILE` to a PEM bundle (your proxy's
+CA), download the `.task` file by hand into `backend/models/`, or pass `--insecure` to skip
+verification for this one public download. The script prints these options when it hits
+the error.
 
 Stop with Ctrl-C / SIGTERM (or `q` in the preview window); the camera and the landmarker
 are released cleanly, connected clients get a WebSocket close (1001 going away), and the

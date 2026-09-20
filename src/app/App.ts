@@ -4,6 +4,7 @@
  */
 import { Vector3 } from 'three';
 import packageJson from '../../package.json';
+import { BUILD_INFO, log } from '../core/log';
 import { type FilteredPose } from '../core/pose';
 import { type AppSettings, type FramingFit, type HumanoidBone, type MocapRecording, type PoseFrame, type Take, DEFAULT_SETTINGS } from '../core/types';
 import { ErrorStats, LandmarkSkeleton3D, Overlay2D, buildDiagnosticsJson, captureSnapshot, summarize, type BoneErrorSummary } from '../diagnostics';
@@ -143,9 +144,17 @@ export class App implements AppActions {
   // ---------------------------------------------------------------------------
 
   async start(): Promise<void> {
+    log.info(`CameraCharacter v${packageJson.version} · commit ${BUILD_INFO.commit} (${BUILD_INFO.branch}) · built ${BUILD_INFO.builtAt}`);
+    log.info(`page ${location.href} · ${navigator.userAgent}`);
     this.layout = buildLayout(this.root, { version: packageJson.version });
     this.toasts = new Toasts(this.root);
     const settings = this.store.get();
+    log.info(
+      `settings: source ${this.url.source ?? 'camera'} · pose ${settings.tracking.poseModel} on ${settings.tracking.delegate}` +
+        ` · hands ${settings.tracking.hands ? 'on' : 'off'} · face ${settings.tracking.face ? 'on' : 'off'}` +
+        ` · camera ${settings.stage.cameraMode} · mirror ${settings.stage.mirror ? 'on' : 'off'} · diagnostics ${settings.diagnostics ? 'on' : 'off'}`,
+      { url: this.url, settings },
+    );
 
     try {
       this.stage = new Stage(this.layout.viewport, settings.stage);
@@ -153,6 +162,7 @@ export class App implements AppActions {
       this.fail(`WebGL is not available: ${(err as Error).message}`);
       return;
     }
+    log.info(`stage: ${this.stage.describeGl()}`);
     // Mouse/touch on the viewport switches to the free camera (the stage already did); double-click or the pill returns.
     this.stage.onCameraTakeover = () => {
       if (this.store.get().stage.cameraMode !== 'orbit') this.store.update({ stage: { cameraMode: 'orbit' } });
@@ -287,6 +297,7 @@ export class App implements AppActions {
     this.latestFrame = frame;
     this.frameDirty = true;
     this.framesProcessed++;
+    if (this.framesProcessed === 1) log.info(`first pose frame from ${frame.src} · ${frame.size[0]}×${frame.size[1]} · subject ${frame.pose ? 'detected' : 'not detected'}`);
     if (this.takeRecorder.isRecording) this.takeRecorder.push(frame);
   }
 
@@ -535,6 +546,7 @@ export class App implements AppActions {
   private async loadModelSource(source: File | string, name: string): Promise<void> {
     if (!this.stage) return;
     this.modelLoading = { name, progress: null };
+    log.info(`model: loading "${name}"${typeof source === 'string' ? ` from ${source}` : ` (${Math.round(source.size / 1024)} KB file)`}`);
     const s = this.store.get();
     try {
       const session = await ModelSession.load(source, {
@@ -555,6 +567,11 @@ export class App implements AppActions {
         this.model.dispose();
       }
       this.model = session;
+      log.info(
+        `model: "${name}" ready · family ${session.analysis.family} · ${Object.keys(session.map).length} bones mapped` +
+          `${session.unrigged ? ' · no skeleton' : ''}${session.warnings.length ? ` · ${session.warnings.length} note(s)` : ''}`,
+        session.warnings,
+      );
       this.stage.setModel(session.wrapper);
       session.wrapper.updateMatrixWorld(true);
       this.solve = null;
@@ -880,7 +897,7 @@ export class App implements AppActions {
     this.errors.push(message);
     if (this.errors.length > 50) this.errors.shift();
     this.toasts?.show(message, 'bad', 7000);
-    console.error(message);
+    log.error(message);
   }
 
   private fail(message: string): void {

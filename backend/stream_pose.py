@@ -22,6 +22,7 @@ import json
 import math
 import os
 import signal
+import ssl
 import sys
 import tempfile
 import threading
@@ -82,7 +83,46 @@ def model_path(variant: str, model_dir: str = DEFAULT_MODEL_DIR) -> str:
     return os.path.join(model_dir, f"pose_landmarker_{variant}.task")
 
 
-def ensure_model(variant: str, model_dir: str = DEFAULT_MODEL_DIR, log: Callable[[str], None] = print) -> str:
+def _ssl_context(insecure: bool = False) -> Optional[ssl.SSLContext]:
+    """TLS context for the model download.
+
+    Python's own trust store is often empty (python.org installers on macOS until
+    "Install Certificates.command" is run), so the CA bundle of the `certifi`
+    package is used when it is installed. `insecure=True` (the --insecure flag)
+    disables verification explicitly for this one public download; it is never
+    the silent default.
+    """
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    try:
+        import certifi  # type: ignore[import-not-found]
+    except ImportError:
+        return None  # urllib's default: the interpreter's trust store (or SSL_CERT_FILE)
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _tls_help(url: str, path: str, exc: BaseException) -> str:
+    return (
+        f"TLS certificate verification failed downloading {url}: {exc}\n"
+        "Python cannot verify Google's certificate with its trust store. Any one of these fixes it:\n"
+        "  - macOS python.org install: run 'Install Certificates.command' in /Applications/Python 3.x/\n"
+        "  - pip install certifi   (this script then uses its CA bundle automatically)\n"
+        "  - export SSL_CERT_FILE=/path/to/ca-bundle.pem   (a corporate proxy's CA, for example)\n"
+        f"  - download the file manually to {path}\n"
+        "  - run with --insecure to skip verification for this download only"
+    )
+
+
+def ensure_model(
+    variant: str,
+    model_dir: str = DEFAULT_MODEL_DIR,
+    log: Callable[[str], None] = print,
+    *,
+    insecure: bool = False,
+) -> str:
     """Return the local path of the .task model, downloading it into model_dir if missing."""
     path = model_path(variant, model_dir)
     if os.path.isfile(path) and os.path.getsize(path) > 0:
@@ -90,11 +130,19 @@ def ensure_model(variant: str, model_dir: str = DEFAULT_MODEL_DIR, log: Callable
     os.makedirs(model_dir, exist_ok=True)
     url = model_url(variant)
     log(f"[model] downloading {url}")
+    if insecure:
+        log("[model] --insecure: TLS certificate verification is OFF for this download")
     tmp_fd, tmp_path = tempfile.mkstemp(prefix=f"pose_landmarker_{variant}.", suffix=".part", dir=model_dir)
     os.close(tmp_fd)
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "CameraCharacter/2 (stream_pose.py)"})
-        with urllib.request.urlopen(request, timeout=60) as response, open(tmp_path, "wb") as out:
+        try:
+            response = urllib.request.urlopen(request, timeout=60, context=_ssl_context(insecure))
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                raise RuntimeError(_tls_help(url, path, exc.reason)) from exc
+            raise
+        with response, open(tmp_path, "wb") as out:
             total_header = response.headers.get("Content-Length")
             total = int(total_header) if total_header and total_header.isdigit() else 0
             done = 0
@@ -685,6 +733,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mirror-preview", action="store_true", help="flip only the preview window horizontally")
     p.add_argument("--max-fps", type=float, default=0.0, help="throttle inference to at most this rate (0 = camera rate)")
     p.add_argument("--model-dir", default=DEFAULT_MODEL_DIR, help="where .task models are cached (default backend/models)")
+    p.add_argument("--insecure", action="store_true",
+                   help="skip TLS certificate verification for the model download (see README: TLS errors)")
     return p
 
 
@@ -704,7 +754,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"--preview needs a GUI-enabled OpenCV build (opencv-python, not -headless): {exc}", file=sys.stderr)
             return 2
     try:
-        model_file = ensure_model(args.model, args.model_dir)
+        model_file = ensure_model(args.model, args.model_dir, insecure=args.insecure)
     except (urllib.error.URLError, OSError, RuntimeError) as exc:
         print(f"model download failed: {exc}", file=sys.stderr)
         return 1

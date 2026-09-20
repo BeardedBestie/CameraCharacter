@@ -183,6 +183,20 @@ export class Stage {
     return this.renderer.domElement;
   }
 
+  /** One line about the graphics backend for the boot log ("WebGL2 · ANGLE (Apple, ...) · max texture 16384"). */
+  describeGl(): string {
+    const gl = this.renderer.getContext();
+    const caps = this.renderer.capabilities;
+    let name = 'unknown renderer';
+    try {
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      name = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+    } catch {
+      // some browsers refuse the extension; the generic name is enough
+    }
+    return `${caps.isWebGL2 ? 'WebGL2' : 'WebGL1'} · ${name} · max texture ${caps.maxTextureSize}`;
+  }
+
   /** Viewport size in CSS pixels. */
   get size(): { width: number; height: number } {
     return { width: this.width, height: this.height };

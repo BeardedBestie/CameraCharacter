@@ -2,6 +2,7 @@
  * Owns the active PoseSource (webcam, synthetic, recording, WebSocket): creation,
  * start/stop, camera selection, playback controls, and the webcam preview element.
  */
+import { log } from '../core/log';
 import type { MocapRecording, PoseFrame, TrackingSettings } from '../core/types';
 import { listSyntheticPresets } from '../testing/syntheticHuman';
 import { listCameras } from '../tracking/camera';
@@ -36,6 +37,8 @@ export class SourceManager {
   private unsubscribe: (() => void)[] = [];
   private generation = 0;
   private lastStatus: SourceStatus = { state: 'idle' };
+  private mountedVideo: HTMLVideoElement | null = null;
+  private lastLogged: { state: string; message: string | undefined } | null = null;
 
   constructor(private readonly opts: SourceManagerOptions) {}
 
@@ -177,12 +180,30 @@ export class SourceManager {
       try {
         this.source.stop();
       } catch (err) {
-        console.warn('source stop failed', err);
+        log.warn('source stop failed', err);
       }
       this.lastStatus = { state: 'stopped' };
     }
     this.source = null;
+    this.mountedVideo = null;
     this.opts.onVideo(null);
+  }
+
+  /** Mounts the webcam element as soon as the source has one (before the model loads), unmounts when it is gone. */
+  private syncVideo(source: PoseSource): void {
+    const video = source instanceof MediaPipeSource ? source.video : null;
+    if (video === this.mountedVideo) return;
+    this.mountedVideo = video;
+    this.opts.onVideo(video);
+  }
+
+  /** One console line per status transition (state or message change); fps-only updates stay quiet. */
+  private logStatus(s: SourceStatus): void {
+    if (this.lastLogged && this.lastLogged.state === s.state && this.lastLogged.message === s.message) return;
+    this.lastLogged = { state: s.state, message: s.message };
+    const line = `source ${this.kind}: ${s.state}${s.message ? ` · ${s.message}` : ''}`;
+    if (s.state === 'error') log.warn(line);
+    else log.info(line);
   }
 
   private async restart(): Promise<void> {
@@ -195,11 +216,14 @@ export class SourceManager {
       this.opts.onError((err as Error).message ?? String(err));
       return;
     }
+    log.info(`source ${this.kind}: starting${this.kind === 'camera' ? ` (camera ${this.cameraId ?? 'default'})` : ''}`);
     this.source = source;
     this.unsubscribe.push(source.onFrame((f) => this.opts.onFrame(f)));
     this.unsubscribe.push(
       source.onStatus((s) => {
         this.lastStatus = s;
+        this.logStatus(s);
+        this.syncVideo(source);
         this.opts.onStatus(s);
       }),
     );
@@ -207,16 +231,13 @@ export class SourceManager {
       await source.start();
     } catch (err) {
       if (gen !== this.generation) return;
+      this.syncVideo(source);
       this.opts.onError(`Source failed to start: ${(err as Error).message ?? err}`);
       return;
     }
     if (gen !== this.generation) return;
-    if (source instanceof MediaPipeSource) {
-      this.opts.onVideo(source.video);
-      if (!this.cameras.length) void this.refreshCameras();
-    } else {
-      this.opts.onVideo(null);
-    }
+    this.syncVideo(source);
+    if (source instanceof MediaPipeSource && !this.cameras.length) void this.refreshCameras();
     if (source instanceof RecordingSource || source instanceof SyntheticSource) {
       source.setLoop(this.loop);
       if (source instanceof RecordingSource) source.setSpeed(this.speed);

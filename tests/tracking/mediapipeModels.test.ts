@@ -7,6 +7,7 @@ import {
   localModelUrl,
   looksLikeTaskBundle,
   poseModelAsset,
+  previewBytes,
   resolveWasmBasePath,
   type FetchLike,
 } from '../../src/tracking/mediapipeModels';
@@ -91,6 +92,28 @@ describe('loadModelAsset', () => {
     };
     const bytes = await loadModelAsset('pose_full', { fetch: fetchImpl, useCache: false });
     expect(Array.from(bytes.slice(0, 4))).toEqual([0, 0, 0x50, 0x4b]);
+  });
+
+  it('explains what answered when the download is not a bundle', async () => {
+    const lines: string[] = [];
+    const blocked = new TextEncoder().encode('<!doctype html><html><title>Blocked by policy</title></html>');
+    const fetchImpl: FetchLike = async (url) => {
+      if (url.startsWith('/models/')) return response(null, { status: 404 });
+      return response(blocked, { type: 'text/html; charset=utf-8' });
+    };
+    await expect(loadModelAsset('pose_full', { fetch: fetchImpl, useCache: false, log: (m) => lines.push(m) })).rejects.toThrow(
+      /not a MediaPipe task bundle \(HTTP 200, text\/html; charset=utf-8, \d+ bytes, starts with "<!doctype html><html><title>Blocked by policy/,
+    );
+    expect(lines).toEqual([
+      'model pose_landmarker_full.task: no self-hosted copy at /models/mediapipe/pose_landmarker_full.task (HTTP 404)',
+      `model pose_landmarker_full.task: downloading ${MODEL_ASSETS.pose_full.url}`,
+    ]);
+  });
+
+  it('previewBytes shows text as text and binaries as hex', () => {
+    expect(previewBytes(new TextEncoder().encode('  <html>\n  hi'))).toBe('"<html> hi"');
+    expect(previewBytes(PUBLISHED)).toBe('00 00 50 4b 03 04 14 00');
+    expect(previewBytes(new Uint8Array())).toBe('');
   });
 
   it('throws when nothing is reachable', async () => {

@@ -25,6 +25,7 @@ import {
   type HandLandmarkerResult,
   type PoseLandmarkerResult,
 } from '@mediapipe/tasks-vision';
+import { log } from '../core/log';
 import type { FaceFrame, HandFrame, PoseFrame, TrackingSettings } from '../core/types';
 import { BaseSource } from './PoseSource';
 import { closeCamera, openCamera } from './camera';
@@ -168,6 +169,12 @@ export class MediaPipeSource extends BaseSource {
         }
         this.videoEl = cam.video;
         this.ownsCamera = true;
+        const track = cam.stream.getVideoTracks()[0];
+        const ts = track?.getSettings?.() ?? {};
+        log.info(
+          `camera opened: "${track?.label || 'unnamed device'}" ${cam.video.videoWidth}×${cam.video.videoHeight}` +
+            `${ts.frameRate ? ` @ ${Math.round(ts.frameRate)} fps` : ''} (${this.options.deviceId ? `device ${this.options.deviceId}` : 'default device'})`,
+        );
       } else if (this.videoEl.paused) {
         await this.videoEl.play();
         if (gen !== this.generation) return;
@@ -175,10 +182,12 @@ export class MediaPipeSource extends BaseSource {
 
       this.setStatus({ state: 'starting', message: 'Loading MediaPipe runtime' });
       if (!this.fileset) {
-        const wasmPath = await resolveWasmBasePath();
+        const t = performance.now();
+        const wasmPath = await resolveWasmBasePath(undefined, (m) => log.info(m));
         const fileset = await FilesetResolver.forVisionTasks(wasmPath);
         if (gen !== this.generation) return;
         this.fileset = fileset;
+        log.info(`MediaPipe runtime loaded from ${wasmPath} in ${Math.round(performance.now() - t)} ms`);
       }
       if (gen !== this.generation) return;
 
@@ -193,8 +202,11 @@ export class MediaPipeSource extends BaseSource {
       this.scheduleNext();
     } catch (err) {
       if (err instanceof StaleGenerationError || gen !== this.generation) return;
+      log.error(`source start failed: ${errorText(err)}`, err);
+      // The camera (if it opened) stays open so the preview keeps showing the
+      // feed next to the error: "camera works, model failed" is diagnosable at
+      // a glance. stop() releases it before any restart.
       this.setStatus({ state: 'error', message: errorText(err) });
-      this.releaseVideo();
       throw err;
     }
   }
@@ -287,8 +299,9 @@ export class MediaPipeSource extends BaseSource {
     const fileset = this.fileset;
     const model = poseModelAsset(settings.poseModel);
     this.setStatus({ message: `Loading pose model (${settings.poseModel})` });
-    const bytes = await loadModelAsset(model);
+    const bytes = await loadModelAsset(model, { log: (m) => log.info(m) });
     this.assertGen(gen);
+    const t = performance.now();
     const create = (delegate: Delegate) =>
       this.adopt(
         PoseLandmarker.createFromOptions(fileset, {
@@ -307,10 +320,12 @@ export class MediaPipeSource extends BaseSource {
       landmarker = await create(delegate);
     } catch (err) {
       if (err instanceof StaleGenerationError || delegate !== 'GPU') throw err;
+      log.warn(`GPU delegate unavailable (${errorText(err)}); using CPU`);
       this.setStatus({ message: `GPU delegate unavailable (${errorText(err)}); using CPU` });
       delegate = 'CPU';
       landmarker = await create('CPU');
     }
+    log.info(`pose landmarker ready: ${settings.poseModel} on ${delegate} (${Math.round(performance.now() - t)} ms)`);
     const old = this.pose;
     this.pose = landmarker;
     this.poseBuilt = { model, requested, actual: delegate };

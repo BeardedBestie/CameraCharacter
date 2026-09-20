@@ -13,6 +13,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "gen:recordings": "tsx scripts/gen-synthetic-mocap.ts",
+    "fetch:models": "tsx scripts/fetch-mediapipe-models.ts",
     "check": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {

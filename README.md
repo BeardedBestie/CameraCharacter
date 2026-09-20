@@ -6,7 +6,7 @@ Intended uses: interactive art installations, quick character puppeteering, moti
 
 > Status: version 2 is a ground-up rebuild of an earlier prototype. The design is documented in [`docs/DESIGN.md`](docs/DESIGN.md); decisions and their provenance are in [`decisionlog.md`](decisionlog.md).
 >
-> **Verified so far** (automatically, without a webcam): the TypeScript build; 333 unit tests covering the math, the filters, the auto-mapper against eleven rig families and every bundled character file, the solver on synthetic rigs and motion, framing, the mirror camera, BVH round trips and the Python provider; and a Playwright suite that boots the app in headless Chromium, loads the bundled models, drives them from synthetic motion and recorded takes, and checks bone error, framing transitions and camera behaviour.
+> **Verified so far** (automatically, without a webcam): the TypeScript build; 335 unit tests covering the math, the filters, the auto-mapper against eleven rig families and every bundled character file, the solver on synthetic rigs and motion, framing, the mirror camera, BVH round trips and the Python provider; and a Playwright suite that boots the app in headless Chromium, loads the bundled models, drives them from synthetic motion and recorded takes, and checks bone error, framing transitions and camera behaviour.
 > **Not yet verified**: live webcam sessions (MediaPipe on real video, hand/face landmarkers, the face-matrix basis), FBX and VRM files from the wild, the pose-calibration flow, and video/GLB export inside a real browser. Open reviewer findings are listed in [`docs/REVIEW-NOTES.md`](docs/REVIEW-NOTES.md). The first live session with the diagnostic snapshot is the next step.
 
 ## What it does
@@ -31,6 +31,26 @@ npm run dev
 Open the printed URL (default `http://localhost:5173`), allow camera access, and either use the bundled sample character or drop a `.glb`, `.gltf`, `.fbx` or `.vrm` file onto the window. Stand back so your whole body is visible for the best result; the character follows immediately.
 
 No webcam? Choose **Source → Synthetic** to drive the character from generated motion (walk, squat, wave, close-up…), or load a recorded `.mocap.json` take.
+
+### Troubleshooting a start-up problem
+
+Open the browser console: every step of the start is logged with a `[cameracharacter +s.sss]`
+prefix. The first line names the version, the **git commit and branch** the running code was
+built from (check it against `git log` when a fix does not seem to arrive), then the settings,
+the WebGL renderer, the model load, and the source: camera opened (device name, size, fps),
+MediaPipe runtime (local copy or CDN), each model bundle (self-hosted copy, browser cache or
+download, with the URL, byte count and timing), the landmarker (delegate, timing) and the
+first pose frame. A failed download says exactly what answered instead of the file (status,
+content type, first bytes), which distinguishes a blocked network from a broken model.
+
+The webcam preview shows the feed as soon as the camera opens, even when the model then fails,
+so a black preview with a `camera: error` chip means the camera itself did not open (permission,
+device in use, no camera): the console line says which.
+
+If the browser cannot download the model bundles from `storage.googleapis.com` (proxy, content
+filter, offline), self-host them: `npm run fetch:models` downloads them into
+`public/models/mediapipe/` (git-ignored) and the app prefers that copy; or copy `.task` files
+there by hand. The MediaPipe WASM runtime is already served from `public/mediapipe/wasm/`.
 
 ### Optional: Python pose provider
 
