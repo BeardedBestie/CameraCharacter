@@ -101,6 +101,8 @@ export class App implements AppActions {
   private errors: string[] = [];
   private rafHandle = 0;
   private lastPanelRefresh = 0;
+  /** The automatic camera mode to return to after the free (orbit) camera. */
+  private lastAutoCameraMode: 'mirror' | 'follow' = 'mirror';
   private lastSourceStatus: SourceStatus = { state: 'idle' };
 
   private overlay: Overlay2D | null = null;
@@ -151,6 +153,12 @@ export class App implements AppActions {
       this.fail(`WebGL is not available: ${(err as Error).message}`);
       return;
     }
+    // Mouse/touch on the viewport switches to the free camera (the stage already did); double-click or the pill returns.
+    this.stage.onCameraTakeover = () => {
+      if (this.store.get().stage.cameraMode !== 'orbit') this.store.update({ stage: { cameraMode: 'orbit' } });
+    };
+    this.stage.onResetView = () => this.store.update({ stage: { cameraMode: this.lastAutoCameraMode } });
+    this.layout.cameraHint.addEventListener('click', () => this.store.update({ stage: { cameraMode: this.lastAutoCameraMode } }));
     this.skeleton3D = new LandmarkSkeleton3D();
     this.skeleton3D.visible = settings.stage.showLandmarkSkeleton;
     this.stage.scene.add(this.skeleton3D.object);
@@ -235,6 +243,10 @@ export class App implements AppActions {
     this.baseline.setSettings(s.smoothing);
     this.layout.setPipMirrored(s.stage.mirror);
     this.stage?.applySettings(s.stage);
+    if (s.stage.cameraMode !== 'orbit') this.lastAutoCameraMode = s.stage.cameraMode;
+    this.layout.setCameraHint(
+      s.stage.cameraMode === 'orbit' ? `Free camera · drag to rotate, wheel to zoom, right-drag to pan · click here or double-click the view for the ${this.lastAutoCameraMode} camera` : null,
+    );
     if (this.skeleton3D) this.skeleton3D.visible = s.stage.showLandmarkSkeleton;
     this.model?.updateOptions({
       smoothing: s.smoothing,
@@ -900,6 +912,7 @@ export class App implements AppActions {
       meanBoneErrorDeg: summary?.meanErrorDeg ?? null,
       flaggedBones: summary ? summary.perBone.filter((b) => b.flagged).map((b) => b.role) : [],
       cameraDistance: this.stage ? this.stage.camera.position.distanceTo(new Vector3(0, this.stage.camera.position.y, 0)) : null,
+      cameraMode: this.stage?.cameraMode ?? null,
       errors: [...this.errors],
     };
   }

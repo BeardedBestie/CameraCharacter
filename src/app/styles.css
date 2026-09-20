@@ -92,6 +92,32 @@ body {
   pointer-events: none;
 }
 
+/* Bottom-centre pill shown while the free (orbit) camera is active */
+#camera-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(29, 32, 39, 0.9);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  z-index: 15;
+}
+
+#camera-hint[hidden] {
+  display: none;
+}
+
+#camera-hint:hover {
+  border-color: var(--accent);
+}
+
 /* Top-left status bar */
 #status-bar {
   position: absolute;

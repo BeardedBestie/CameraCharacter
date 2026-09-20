@@ -12,6 +12,8 @@ import {
 } from '../../src/tracking/mediapipeModels';
 
 const ZIP = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4]);
+/** The first bytes of Google's published pose_landmarker_full.task: two NUL bytes, then the zip signature. */
+const PUBLISHED = new Uint8Array([0x00, 0x00, 0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa7, 0x05, 0x9c, 0x56]);
 const HTML = new TextEncoder().encode('<!doctype html><html></html>');
 
 function response(body: Uint8Array | null, init: { status?: number; type?: string } = {}): Response {
@@ -42,7 +44,19 @@ describe('model asset table', () => {
     expect(looksLikeTaskBundle(null, ZIP)).toBe(true);
     expect(looksLikeTaskBundle('text/html', ZIP)).toBe(false);
     expect(looksLikeTaskBundle(null, HTML)).toBe(false);
+    expect(looksLikeTaskBundle(null, new TextEncoder().encode('\n  <!doctype html>'))).toBe(false);
     expect(looksLikeTaskBundle(null, new Uint8Array([1]))).toBe(false);
+  });
+
+  it('looksLikeTaskBundle accepts the published bundles (zip signature after a two-byte prefix)', () => {
+    expect(looksLikeTaskBundle('application/octet-stream', PUBLISHED)).toBe(true);
+    expect(looksLikeTaskBundle(null, PUBLISHED)).toBe(true);
+  });
+
+  it('looksLikeTaskBundle accepts a large non-HTML body and refuses a small unknown one', () => {
+    const big = new Uint8Array(300 * 1024).fill(0x11);
+    expect(looksLikeTaskBundle('application/octet-stream', big)).toBe(true);
+    expect(looksLikeTaskBundle(null, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]))).toBe(false);
   });
 });
 
@@ -68,6 +82,15 @@ describe('loadModelAsset', () => {
     const bytes = await loadModelAsset('pose_lite', { fetch: fetchImpl, useCache: false });
     expect(bytes[0]).toBe(0x50);
     expect(calls).toEqual(['/models/mediapipe/pose_landmarker_lite.task', MODEL_ASSETS.pose_lite.url]);
+  });
+
+  it('accepts the bytes Google actually serves', async () => {
+    const fetchImpl: FetchLike = async (url) => {
+      if (url.startsWith('/models/')) return response(HTML, { type: 'text/html' });
+      return response(PUBLISHED, { type: 'application/octet-stream' });
+    };
+    const bytes = await loadModelAsset('pose_full', { fetch: fetchImpl, useCache: false });
+    expect(Array.from(bytes.slice(0, 4))).toEqual([0, 0, 0x50, 0x4b]);
   });
 
   it('throws when nothing is reachable', async () => {

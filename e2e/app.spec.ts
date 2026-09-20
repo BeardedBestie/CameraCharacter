@@ -17,6 +17,7 @@ interface DebugState {
   meanBoneErrorDeg: number | null;
   flaggedBones: string[];
   cameraDistance: number | null;
+  cameraMode: string | null;
   errors: string[];
 }
 
@@ -138,6 +139,35 @@ test.describe('CameraCharacter (synthetic source)', () => {
     const solved = (await debugState(page)).framesSolved;
     const s = await waitFor(page, (st) => st.framesSolved > solved + 30);
     expect(s.errors).toEqual([]);
+    const benign = consoleErrors.filter((e) => !/favicon|ERR_INTERNET_DISCONNECTED|net::ERR/i.test(e));
+    expect(benign).toEqual([]);
+  });
+
+  test('mouse input takes over the camera and a double-click hands it back', async ({ page }) => {
+    const consoleErrors = collectConsoleErrors(page);
+    await page.goto(`/?source=synthetic&preset=walk&model=${MODEL}&autoplay=1&camera=mirror&kiosk=1`);
+    const start = await waitFor(page, (st) => st.ready && !!st.model && st.framesSolved > 30);
+    expect(start.cameraMode).toBe('mirror');
+    const box = await page.locator('#viewport canvas').boundingBox();
+    expect(box).not.toBeNull();
+    const cx = box!.x + box!.width * 0.6;
+    const cy = box!.y + box!.height * 0.4;
+    // A drag on the viewport switches to the free camera at once.
+    await page.mouse.move(cx, cy);
+    await page.mouse.down();
+    await page.mouse.move(cx + 120, cy + 20, { steps: 6 });
+    await page.mouse.up();
+    const orbiting = await waitFor(page, (st) => st.cameraMode === 'orbit', 10_000);
+    expect(orbiting.cameraDistance).not.toBeNull();
+    // The wheel zooms the free camera in.
+    const before = orbiting.cameraDistance!;
+    await page.mouse.move(cx, cy);
+    await page.mouse.wheel(0, -500);
+    await waitFor(page, (st) => st.cameraMode === 'orbit' && st.cameraDistance !== null && st.cameraDistance < before - 0.2, 10_000);
+    // A double-click returns to the automatic camera.
+    await page.mouse.dblclick(cx, cy);
+    const back = await waitFor(page, (st) => st.cameraMode === 'mirror', 10_000);
+    expect(back.errors).toEqual([]);
     const benign = consoleErrors.filter((e) => !/favicon|ERR_INTERNET_DISCONNECTED|net::ERR/i.test(e));
     expect(benign).toEqual([]);
   });

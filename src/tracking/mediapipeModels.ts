@@ -89,16 +89,31 @@ function defaultFetch(): FetchLike {
   return (input, init) => fetch(input, init);
 }
 
+/** Smallest plausible bundle: the lite pose model is 5.5 MB, a dev server's HTML fallback page a few KB. */
+const MIN_TASK_BYTES = 256 * 1024;
+/** How far into the body the zip signature may sit (the published files carry a two-byte prefix). */
+const ZIP_SIGNATURE_WINDOW = 16;
+
 /**
  * True when a response plausibly holds a `.task` bundle. Dev servers answer
- * unknown paths with the SPA's index.html (status 200), so the content type
- * and the first bytes are checked: a `.task` file is a zip archive ("PK").
+ * unknown paths with the SPA's index.html (status 200), so that page must be
+ * refused. A `.task` file is a zip archive, but Google's published bundles
+ * start with two NUL bytes before the "PK\x03\x04" signature, so the signature
+ * is searched within the first bytes rather than required at offset 0. Any
+ * other large non-HTML body is accepted as well, so a future container format
+ * does not make the loader refuse a genuine download again.
  */
 export function looksLikeTaskBundle(contentType: string | null, bytes: Uint8Array): boolean {
   if (bytes.length < 4) return false;
   if (contentType && /text\/html/i.test(contentType)) return false;
-  if (bytes[0] === 0x3c /* '<' */) return false;
-  return bytes[0] === 0x50 && bytes[1] === 0x4b; // 'P' 'K'
+  const last = Math.min(bytes.length - 4, ZIP_SIGNATURE_WINDOW);
+  for (let i = 0; i <= last; i++) {
+    if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x03 && bytes[i + 3] === 0x04) return true;
+  }
+  let j = 0;
+  while (j < bytes.length && (bytes[j] === 0x20 || bytes[j] === 0x09 || bytes[j] === 0x0a || bytes[j] === 0x0d)) j++;
+  if (bytes[j] === 0x3c /* '<' */) return false;
+  return bytes.length >= MIN_TASK_BYTES;
 }
 
 async function fetchBytes(fetchImpl: FetchLike, url: string): Promise<Uint8Array | null> {

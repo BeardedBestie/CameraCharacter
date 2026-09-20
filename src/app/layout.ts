@@ -19,12 +19,16 @@ export interface Layout {
   panel: HTMLElement;
   panelBody: HTMLElement;
   panelToggle: HTMLButtonElement;
+  /** Bottom-centre pill shown while the free (orbit) camera is active; clicking it returns to the automatic camera. */
+  cameraHint: HTMLButtonElement;
   setPanelCollapsed(v: boolean): void;
   isPanelCollapsed(): boolean;
   setPipVisible(v: boolean): void;
   setPipMirrored(v: boolean): void;
   showCountdown(number: number | null, text: string): void;
   hideCountdown(): void;
+  /** Shows the free-camera pill with `text`, or hides it with null. */
+  setCameraHint(text: string | null): void;
 }
 
 export function buildLayout(root: HTMLElement, opts: { version: string }): Layout {
@@ -53,12 +57,14 @@ export function buildLayout(root: HTMLElement, opts: { version: string }): Layou
   const countdownText = el('small', { text: '' });
   const countdown = el('div', { id: 'countdown' }, countdownNumber, countdownText);
 
+  const cameraHint = el('button', { id: 'camera-hint', type: 'button', title: 'Return to the automatic camera', hidden: true });
+
   const panelToggle = el('button', { id: 'panel-toggle', title: 'Toggle panel (Tab)', text: '☰' });
   const panelHeader = el('div', { id: 'panel-header' }, el('h1', { text: 'CameraCharacter' }), el('span', { text: `v${opts.version}` }));
   const panelBody = el('div', { id: 'panel-body' });
   const panel = el('div', { id: 'panel' }, panelToggle, panelHeader, panelBody);
 
-  root.append(viewport, pip, statusBar, dropOverlay, countdown, panel);
+  root.append(viewport, pip, statusBar, dropOverlay, countdown, cameraHint, panel);
 
   const layout: Layout = {
     viewport,
@@ -75,6 +81,7 @@ export function buildLayout(root: HTMLElement, opts: { version: string }): Layou
     panel,
     panelBody,
     panelToggle,
+    cameraHint,
     setPanelCollapsed: (v) => panel.classList.toggle('collapsed', v),
     isPanelCollapsed: () => panel.classList.contains('collapsed'),
     setPipVisible: (v) => pip.classList.toggle('hidden', !v),
@@ -85,6 +92,14 @@ export function buildLayout(root: HTMLElement, opts: { version: string }): Layou
       countdown.classList.add('active');
     },
     hideCountdown: () => countdown.classList.remove('active'),
+    setCameraHint: (text) => {
+      if (text === null) {
+        cameraHint.hidden = true;
+        return;
+      }
+      if (cameraHint.textContent !== text) cameraHint.textContent = text;
+      cameraHint.hidden = false;
+    },
   };
   panelToggle.addEventListener('click', () => layout.setPanelCollapsed(!layout.isPanelCollapsed()));
   return layout;

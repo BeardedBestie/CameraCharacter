@@ -2,7 +2,7 @@
  * Contract between the control panels (pure UI) and the App (orchestration).
  * Panels call actions and receive view models; they never touch the pipeline.
  */
-import type { BoneRefMode, FramingState, HumanoidBone } from '../core/types';
+import type { BoneRefMode, CameraMode, FramingState, HumanoidBone } from '../core/types';
 
 export type SourceKind = 'camera' | 'recording' | 'synthetic' | 'websocket';
 
@@ -160,5 +160,6 @@ export interface AppDebugState {
   meanBoneErrorDeg: number | null;
   flaggedBones: HumanoidBone[];
   cameraDistance: number | null;
+  cameraMode: CameraMode | null;
   errors: string[];
 }

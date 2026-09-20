@@ -12,7 +12,7 @@ export function createStagePanel(store: SettingsStore, _actions: AppActions): Pa
     [
       { value: 'mirror', label: 'Mirror (frames the character as the webcam frames you)' },
       { value: 'follow', label: 'Follow (full body, pans with you)' },
-      { value: 'orbit', label: 'Orbit (drag to look around)' },
+      { value: 'orbit', label: 'Free / orbit (mouse controlled)' },
     ],
     s.stage.cameraMode,
     (v) => store.update({ stage: { cameraMode: v } }),
@@ -38,6 +38,7 @@ export function createStagePanel(store: SettingsStore, _actions: AppActions): Pa
   sec.body.append(
     row('', mirror.root),
     row('Camera', camera.root),
+    hint('Drag or scroll on the viewport to take over the camera: left-drag rotates, wheel zooms, right-drag or two fingers pan. Double-click the viewport to return to the automatic camera.'),
     row('Mirror FOV', fov.root),
     row('Translation', hips.root),
     hint('In mirror camera mode depth drives the framing rather than the character.'),

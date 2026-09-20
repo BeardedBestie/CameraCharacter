@@ -14,7 +14,7 @@ import {
   Mesh,
   MeshStandardMaterial,
   Object3D,
-  PCFSoftShadowMap,
+  PCFShadowMap,
   PerspectiveCamera,
   SRGBColorSpace,
   Scene,
@@ -25,6 +25,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import type { CameraMode, StageSettings } from '../core/types';
 import { MirrorCameraController, type MirrorCameraInput } from './MirrorCamera';
 import { disposeObject, enableShadows, findSpawn } from './placement';
+import { installViewportInput } from './viewportInput';
 
 export interface StageOptions {
   /** Cap on the device pixel ratio (default 2). */
@@ -53,6 +54,10 @@ export class Stage {
 
   /** Called every frame before rendering (after the camera update). */
   onBeforeRender: ((dt: number, stage: Stage) => void) | null = null;
+  /** Called after a drag or wheel on the viewport switched the camera to orbit mode. */
+  onCameraTakeover: (() => void) | null = null;
+  /** Called on a double-click on the viewport; the app returns to its automatic camera. */
+  onResetView: (() => void) | null = null;
 
   private settings: StageSettings;
   private model: Object3D | null = null;
@@ -61,6 +66,7 @@ export class Stage {
   private readonly modelOriginValue = new Vector3();
   private cameraInput: MirrorCameraInput | null = null;
   private resizeObserver: ResizeObserver | null = null;
+  private removeViewportInput: (() => void) | null = null;
   private readonly onWindowResize = (): void => this.resize();
   private disposed = false;
   private width = 1;
@@ -75,7 +81,7 @@ export class Stage {
     this.renderer.toneMapping = ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.0;
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = PCFSoftShadowMap;
+    this.renderer.shadowMap.type = PCFShadowMap;
     const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
     this.renderer.setPixelRatio(Math.min(dpr, opts.maxPixelRatio ?? 2));
     const el = this.renderer.domElement;
@@ -148,6 +154,18 @@ export class Stage {
       vfovDeg: settings.mirrorCameraFovDeg,
       controls: this.controls,
       mode: settings.cameraMode,
+    });
+
+    // Standard mouse/touch camera controls in every mode: the first drag or
+    // wheel hands the camera to OrbitControls from where the automatic camera
+    // left it (rotate, zoom, pan); a double-click asks the app to hand it back.
+    this.removeViewportInput = installViewportInput(el, {
+      isManual: () => this.mirrorCamera.mode === 'orbit',
+      onTakeOver: () => {
+        this.setCameraMode('orbit');
+        this.onCameraTakeover?.();
+      },
+      onResetView: () => this.onResetView?.(),
     });
 
     this.applySettings(settings);
@@ -302,6 +320,8 @@ export class Stage {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     if (typeof window !== 'undefined') window.removeEventListener('resize', this.onWindowResize);
+    this.removeViewportInput?.();
+    this.removeViewportInput = null;
     this.controls.dispose();
     if (this.model) this.scene.remove(this.model);
     if (this.environment) this.scene.remove(this.environment);
