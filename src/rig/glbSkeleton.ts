@@ -12,7 +12,7 @@
  * bind matrices directly give scene-space joint transforms and skinned
  * geometry bounds are already in bind space.
  */
-import { Bone, Box3, Matrix4, Object3D, Quaternion, Vector3 } from 'three';
+import { Bone, Box3, BufferGeometry, Matrix4, Mesh, Object3D, Quaternion, Vector3 } from 'three';
 import type { Vec3Tuple } from '../core/types';
 import { buildGraphFromObject3D, groupSkins, type SkeletonGraph } from './skeletonGraph';
 
@@ -59,8 +59,12 @@ export interface GlbSkeletonResult {
   graph: SkeletonGraph;
   /** Summed skin weight per joint object. */
   weights: Map<Object3D, number>;
+  /** Alias of {@link weights}. */
+  skinWeights: Map<Object3D, number>;
   /** Joints of the primary skeleton group. */
   joints: Set<Object3D>;
+  /** Every skin of the file: joint objects and their inverse bind matrices (identity when the file has none). */
+  skins: { joints: Object3D[]; inverseBindMatrices: Matrix4[] }[];
   /** Bind-pose mesh extent along +Y, when any mesh has bounds. */
   meshHeight?: number;
   /** Bind-space axis-aligned bounds of all meshes (skinned: bind space; static: node transforms). */
@@ -172,7 +176,8 @@ export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonRes
   for (const skin of skins) for (const j of skin.joints) jointSet.add(j);
 
   const objects: Object3D[] = nodes.map((n, i) => {
-    const obj = jointSet.has(i) ? new Bone() : new Object3D();
+    // Mesh nodes become (empty) meshes so they leave the skeleton graph exactly as in the browser.
+    const obj = jointSet.has(i) ? new Bone() : n.mesh !== undefined ? new Mesh(new BufferGeometry()) : new Object3D();
     obj.name = n.name ?? (jointSet.has(i) ? `joint_${i}` : `node_${i}`);
     nodeLocalMatrix(n).decompose(obj.position, obj.quaternion, obj.scale);
     obj.updateMatrix();
@@ -198,13 +203,22 @@ export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonRes
 
   // Bind pose from inverse bind matrices (same procedure as applyBindPose).
   const targets = new Map<Object3D, Matrix4>();
+  const skinRecords: GlbSkeletonResult['skins'] = [];
   for (const skin of skins) {
-    if (skin.inverseBindMatrices === undefined) continue; // identity IBMs: node transforms are the bind pose
+    const jointObjs = skin.joints.map((j) => objects[j]).filter((o): o is Object3D => !!o);
+    if (skin.inverseBindMatrices === undefined) {
+      // Identity IBMs: the node transforms are the bind pose.
+      skinRecords.push({ joints: jointObjs, inverseBindMatrices: jointObjs.map(() => new Matrix4()) });
+      continue;
+    }
     const { data } = readAccessor(json, bin, skin.inverseBindMatrices);
+    const ibms: Matrix4[] = [];
     skin.joints.forEach((j, k) => {
       const obj = objects[j];
       if (!obj) return;
-      const world = new Matrix4().fromArray(Array.from(data.subarray(k * 16, k * 16 + 16))).invert();
+      const ibm = new Matrix4().fromArray(Array.from(data.subarray(k * 16, k * 16 + 16)));
+      ibms.push(ibm);
+      const world = ibm.clone().invert();
       if (!Number.isFinite(world.elements[0])) return;
       const prev = targets.get(obj);
       if (prev) {
@@ -215,6 +229,7 @@ export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonRes
       }
       targets.set(obj, world);
     });
+    skinRecords.push({ joints: jointObjs, inverseBindMatrices: ibms });
   }
   if (targets.size > 0) {
     const ordered: Object3D[] = [];
@@ -333,7 +348,7 @@ export function readGlbSkeleton(bytes: ArrayBuffer | Uint8Array): GlbSkeletonRes
   });
 
   const graph = buildGraphFromObject3D(root, { joints, weights, skinnedMeshCount, warnings });
-  const result: GlbSkeletonResult = { root, graph, weights, joints, meshNames, skinnedMeshCount, generator: json.asset?.generator, json, warnings: graph.warnings };
+  const result: GlbSkeletonResult = { root, graph, weights, skinWeights: weights, joints, skins: skinRecords, meshNames, skinnedMeshCount, generator: json.asset?.generator, json, warnings: graph.warnings };
   if (any) {
     result.meshBounds = { min: [box.min.x, box.min.y, box.min.z], max: [box.max.x, box.max.y, box.max.z] };
     result.meshHeight = box.max.y - box.min.y;

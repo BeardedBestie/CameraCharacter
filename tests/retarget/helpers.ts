@@ -7,11 +7,25 @@
  */
 import { Bone, Matrix4, Object3D, Quaternion, Vector3 } from 'three';
 import type { FilteredPose } from '../../src/core/pose';
-import type { BoneSettings, HeightTable, HumanoidBone, PoseFrame, RigAnalysis, RigBoneAnalysis, SmoothingSettings } from '../../src/core/types';
+import type {
+  BoneSettings,
+  FramingFit,
+  HeightTable,
+  HipsMode,
+  HumanoidBone,
+  PoseFrame,
+  RigAnalysis,
+  RigBoneAnalysis,
+  SmoothingSettings,
+} from '../../src/core/types';
 import { DEFAULT_SETTINGS, HUMANOID_PARENT } from '../../src/core/types';
 import { DEG2RAD, angleBetween, flexionUp, kneecapUp, perpendicularComponent } from '../../src/core/math';
 import { canonicalDeviationDeg, isAnatomical } from '../../src/retarget/canonical';
-import { POSE_LANDMARK_COUNT } from '../../src/tracking/landmarks';
+import { BodyModel, type BodyModelResult } from '../../src/retarget/bodyModel';
+import { fitFraming } from '../../src/retarget/framing';
+import { Retargeter, type SolveResult } from '../../src/retarget/solver';
+import { LM, POSE_LANDMARK_COUNT } from '../../src/tracking/landmarks';
+import { SYNTHETIC_PRESETS, computeLandmarkPositions, toPoseFrame } from '../../src/testing/syntheticHuman';
 
 export const SMOOTHING: SmoothingSettings = { ...DEFAULT_SETTINGS.smoothing, poseHoldMs: { ...DEFAULT_SETTINGS.smoothing.poseHoldMs } };
 
@@ -32,6 +46,8 @@ export interface RigOptions {
   intermediates?: boolean;
   /** Include clavicle bones. */
   shoulders?: boolean;
+  /** Include an upperChest bone between chest and neck (22 mapped roles with shoulders). */
+  upperChest?: boolean;
 }
 
 /** Joint name -> world position (final scene frame) and parent joint. */
@@ -70,15 +86,21 @@ function jointSpecs(opts: RigOptions): Record<string, JointSpec> {
   }
   add('spine', v(0, 1.05, 0), spineParent, 'spine');
   add('chest', v(0, 1.2, 0), 'spine', 'chest');
-  add('neck', v(0, 1.45, 0), 'chest', 'neck');
+  let neckParent = 'chest';
+  if (opts.upperChest) {
+    add('upperChest', v(0, 1.32, 0), 'chest', 'upperChest');
+    neckParent = 'upperChest';
+  }
+  add('neck', v(0, 1.45, 0), neckParent, 'neck');
   add('head', v(0, 1.55, 0), 'neck', 'head');
   add('headEnd', v(0, 1.72, 0), 'head');
 
   for (const side of ['left', 'right'] as const) {
     const s = side === 'left' ? 1 : -1;
     const S = side === 'left' ? 'left' : 'right';
-    const armParent = opts.shoulders ? `${side}Shoulder` : 'chest';
-    if (opts.shoulders) add(`${side}Shoulder`, v(s * 0.04, 1.42, 0), 'chest', `${S}Shoulder` as HumanoidBone);
+    const torsoTop = opts.upperChest ? 'upperChest' : 'chest';
+    const armParent = opts.shoulders ? `${side}Shoulder` : torsoTop;
+    if (opts.shoulders) add(`${side}Shoulder`, v(s * 0.04, 1.42, 0), torsoTop, `${S}Shoulder` as HumanoidBone);
     const ua = v(s * 0.18, 1.42, 0);
     let uaDir: Vector3;
     let laDir: Vector3;
@@ -197,7 +219,7 @@ export function buildRig(opts: RigOptions): BuiltRig {
   const boneSettings: Partial<Record<HumanoidBone, BoneSettings>> = {};
   for (const [role, bs] of Object.entries(analysis.defaultBones)) boneSettings[role as HumanoidBone] = { ...bs! };
   return {
-    name: `${opts.pose}-${opts.axis}${opts.armature ? '-armature' : ''}${opts.intermediates ? '-inter' : ''}`,
+    name: `${opts.pose}-${opts.axis}${opts.armature ? '-armature' : ''}${opts.intermediates ? '-inter' : ''}${opts.shoulders ? '-sh' : ''}${opts.upperChest ? '-uc' : ''}`,
     root,
     armature,
     bones,
@@ -465,4 +487,162 @@ export function tailNode(rig: BuiltRig, role: HumanoidBone): Object3D | null {
 
 export function degrees(rad: number): number {
   return (rad * 180) / Math.PI;
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline: BodyModel -> framing -> Retargeter on a built rig
+// ---------------------------------------------------------------------------
+
+export interface PipelineOptions {
+  hipsMode?: HipsMode;
+  cameraVfovDeg?: number;
+  depthTranslation?: boolean;
+  settings?: SmoothingSettings;
+}
+
+export interface Pipeline {
+  rig: BuiltRig;
+  model: BodyModel;
+  retargeter: Retargeter;
+  fit: FramingFit | null;
+  last: { result: BodyModelResult; solve: SolveResult; fit: FramingFit } | null;
+  /** One frame: body model, framing fit and solve. */
+  step(pose: FilteredPose, dt: number): { result: BodyModelResult; solve: SolveResult; fit: FramingFit };
+  /** Repeats the same frame until the bones have converged (dt = 0.1 s x 30 by default). */
+  converge(pose: FilteredPose, iterations?: number, dt?: number): { result: BodyModelResult; solve: SolveResult; fit: FramingFit };
+}
+
+/** The synthetic presets use a 60° vertical FOV camera. */
+export const SYNTHETIC_VFOV_DEG = 60;
+
+export function makePipeline(rig: BuiltRig, opts: PipelineOptions = {}): Pipeline {
+  const settings = opts.settings ?? SMOOTHING;
+  const model = new BodyModel(settings);
+  const retargeter = new Retargeter({
+    bones: rig.bones,
+    analysis: rig.analysis,
+    settings,
+    boneSettings: rig.boneSettings,
+    hipsMode: opts.hipsMode ?? 'horizontal',
+    cameraVfovDeg: opts.cameraVfovDeg ?? SYNTHETIC_VFOV_DEG,
+    depthTranslation: opts.depthTranslation ?? true,
+  });
+  const pipe: Pipeline = {
+    rig,
+    model,
+    retargeter,
+    fit: null,
+    last: null,
+    step(pose, dt) {
+      const fit = fitFraming(pose, pipe.fit, dt);
+      pipe.fit = fit;
+      const result = model.update(pose, dt, {
+        framing: fit.state,
+        noKnee: rig.analysis.noKnee,
+        noElbow: rig.analysis.noElbow,
+        mirror: pose.mirror,
+      });
+      const solve = retargeter.solve(result, pose, dt, fit);
+      pipe.last = { result, solve, fit };
+      return pipe.last;
+    },
+    converge(pose, iterations = 30, dt = 0.1) {
+      let out = pipe.step(pose, dt);
+      for (let i = 1; i < iterations; i++) out = pipe.step(pose, dt);
+      return out;
+    },
+  };
+  return pipe;
+}
+
+/** Frames of a synthetic preset at evenly spaced times (fractions of its duration). */
+export function presetFrames(name: string, fractions: readonly number[] = [0, 0.25, 0.5, 0.75]): PoseFrame[] {
+  const preset = SYNTHETIC_PRESETS[name];
+  if (!preset) throw new Error(`unknown preset ${name}`);
+  return fractions.map((f) => {
+    const t = f * preset.durationSec;
+    const pose = preset.poseAt(t);
+    const cam = preset.cameraAt ? preset.cameraAt(t) : preset.camera;
+    return toPoseFrame(computeLandmarkPositions(pose), cam, Math.round(t * 1000), { visibilityOverride: pose.visibilityOverride });
+  });
+}
+
+/**
+ * Ground-truth measured directions per DESIGN §6.1 computed directly from
+ * landmark positions (three.js coords), independent of the BodyModel.
+ */
+export function groundTruthDirections(P: Vector3[]): Partial<Record<HumanoidBone, Vector3>> {
+  const mid = (a: number, b: number) => P[a].clone().add(P[b]).multiplyScalar(0.5);
+  const dir = (a: Vector3, b: Vector3) => b.clone().sub(a).normalize();
+  const midHip = mid(LM.LEFT_HIP, LM.RIGHT_HIP);
+  const midShoulder = mid(LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER);
+  const midEar = mid(LM.LEFT_EAR, LM.RIGHT_EAR);
+  const midEye = mid(LM.LEFT_EYE, LM.RIGHT_EYE);
+  const earAxis = P[LM.RIGHT_EAR].clone().sub(P[LM.LEFT_EAR]).normalize();
+  const fwd = perpendicularComponent(midEye.clone().sub(midEar), earAxis)!;
+  const out: Partial<Record<HumanoidBone, Vector3>> = {
+    hips: dir(midHip, midShoulder),
+    neck: dir(midShoulder, midEar),
+    head: new Vector3().crossVectors(earAxis, fwd).normalize(),
+  };
+  for (const side of ['left', 'right'] as const) {
+    const L = side === 'left';
+    const S = (l: number, r: number) => (L ? l : r);
+    const shoulder = P[S(LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER)];
+    const elbow = P[S(LM.LEFT_ELBOW, LM.RIGHT_ELBOW)];
+    const wrist = P[S(LM.LEFT_WRIST, LM.RIGHT_WRIST)];
+    const index = P[S(LM.LEFT_INDEX, LM.RIGHT_INDEX)];
+    const pinky = P[S(LM.LEFT_PINKY, LM.RIGHT_PINKY)];
+    const hip = P[S(LM.LEFT_HIP, LM.RIGHT_HIP)];
+    const knee = P[S(LM.LEFT_KNEE, LM.RIGHT_KNEE)];
+    const ankle = P[S(LM.LEFT_ANKLE, LM.RIGHT_ANKLE)];
+    const heel = P[S(LM.LEFT_HEEL, LM.RIGHT_HEEL)];
+    const foot = P[S(LM.LEFT_FOOT_INDEX, LM.RIGHT_FOOT_INDEX)];
+    out[`${side}Shoulder`] = dir(midShoulder, shoulder);
+    out[`${side}UpperArm`] = dir(shoulder, elbow);
+    out[`${side}LowerArm`] = dir(elbow, wrist);
+    out[`${side}Hand`] = dir(wrist, index.clone().add(pinky).multiplyScalar(0.5));
+    out[`${side}UpperLeg`] = dir(hip, knee);
+    out[`${side}LowerLeg`] = dir(knee, ankle);
+    out[`${side}Foot`] = dir(ankle, foot);
+    const toes = foot.clone().sub(heel);
+    toes.y = 0;
+    out[`${side}Toes`] = toes.normalize();
+  }
+  return out;
+}
+
+/** World rotation of a bone relative to its bind world rotation (the solver's world delta). */
+export function worldDelta(rig: BuiltRig, role: HumanoidBone, out = new Quaternion()): Quaternion {
+  const bone = rig.bones[role]!;
+  const rest = new Quaternion().fromArray(rig.analysis.analysis[role]!.restQuat);
+  bone.getWorldQuaternion(out);
+  return out.multiply(rest.invert());
+}
+
+/** Yaw (degrees) of a bone's forward axis: the bind +Z rotated by the world delta, projected on the ground plane. */
+export function forwardYawDeg(rig: BuiltRig, role: HumanoidBone): number {
+  const f = new Vector3(0, 0, 1).applyQuaternion(worldDelta(rig, role));
+  return degrees(Math.atan2(f.x, f.z));
+}
+
+export function assertFinite(rig: BuiltRig): void {
+  for (const node of Object.values(rig.nodes)) {
+    const q = node.quaternion;
+    const p = node.position;
+    for (const v of [q.x, q.y, q.z, q.w, p.x, p.y, p.z]) if (!Number.isFinite(v)) throw new Error(`${node.name} is not finite`);
+    if (Math.abs(q.length() - 1) > 1e-4) throw new Error(`${node.name} quaternion is not unit (${q.length()})`);
+  }
+}
+
+/** Tiny deterministic PRNG for jitter tests. */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }

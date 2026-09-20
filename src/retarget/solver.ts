@@ -37,7 +37,7 @@ import { LM } from '../tracking/landmarks';
 import type { BodyModelResult, MeasuredBasis } from './bodyModel';
 import { RunningMedian } from './bodyModel';
 import { CANONICAL } from './canonical';
-import { effectiveTorsoBaseline, referenceBasisFor } from './calibration';
+import { canonicalUpMinRotated, effectiveTorsoBaseline, referenceBasisFor } from './calibration';
 
 export interface RetargeterOptions {
   /** Mapped three.js nodes by role (in their bind pose, matrixWorld up to date). */
@@ -53,6 +53,14 @@ export interface RetargeterOptions {
   depthTranslation?: boolean;
   /** Standing torso baseline from `StandingBaseline` (optional; the calibration's baseline wins). */
   torsoBaseline?: RefBasisRecord | null;
+  /**
+   * Standing bases of the neck and head from `StandingBaseline` (optional). In
+   * `relative` mode their pitch relative to the torso baseline is folded into
+   * the reference, so a level head drives the model's head to its bind pose
+   * (MediaPipe's eye landmarks sit above the ears, which tilts the raw head
+   * basis back).
+   */
+  standingBases?: Partial<Record<HumanoidBone, RefBasisRecord>> | null;
 }
 
 export interface SolveRoleResult {
@@ -79,15 +87,19 @@ export interface SolveResult {
 
 /** Fraction of the upper arm swing applied to the shoulder (clavicle) bone. */
 export const SHOULDER_SWING_FRACTION = 0.3;
-/** Pronation fraction for rigs without forearm twist helpers (a gentle default that avoids candy-wrapping). */
-export const DEFAULT_LOWER_ARM_TWIST_FRACTION = 0.25;
+/** Pronation fraction for rigs without forearm twist helpers: none (the hand takes all of it), per DESIGN §6.3. */
+export const DEFAULT_LOWER_ARM_TWIST_FRACTION = 0;
 /** Seconds of running history for the depth reference median. */
 export const Z_REF_WINDOW_SEC = 20;
 const Z_REF_SAMPLE_SEC = 0.1;
 /** Seconds over which the vertical hips offset blends back in when the ankles return. */
 const VERTICAL_BLEND_SEC = 1;
-/** Slow decay (m/s) of the standing running max so a jump does not raise the floor forever. */
-const STANDING_MAX_DECAY = 0.02;
+/**
+ * Very slow decay (m/s) of the standing running max (DESIGN §6.3 asks for a
+ * running max): a single noisy spike heals within a minute or two, while a
+ * user who stays crouched does not see the model rise.
+ */
+const STANDING_MAX_DECAY = 0.001;
 
 /** Preferred humanoid child used for a role's direction when the analysis gives none. */
 const PREFERRED_CHILD: Partial<Record<HumanoidBone, readonly HumanoidBone[]>> = {
@@ -183,7 +195,10 @@ export class Retargeter {
   private cameraVfovDeg: number;
   private depthTranslation: boolean;
   private standingBaseline: RefBasisRecord | null;
+  private standingBases: Partial<Record<HumanoidBone, RefBasisRecord>> | null;
   private readonly analysis: RigAnalysis;
+  /** Shoulder/upper-arm pairs for the clavicle share of the arm swing (built once). */
+  private readonly shoulderPairs: { shoulder: RoleEntry; upperArm: RoleEntry }[] = [];
 
   private readonly entries: RoleEntry[] = [];
   private readonly byRole = new Map<HumanoidBone, RoleEntry>();
@@ -208,6 +223,10 @@ export class Retargeter {
   private readonly hipsTarget = new Vector3();
   private hipsTargetValid = false;
   private depthZ: number | null = null;
+  /** Rig leg geometry for the vertical policy: thigh head -> ankle length, hips bone -> thigh head drop, ankle rest height. */
+  private modelLeg = 0;
+  private hipJointDrop = 0;
+  private ankleRest = 0;
 
   constructor(opts: RetargeterOptions) {
     this.settings = opts.settings;
@@ -217,13 +236,16 @@ export class Retargeter {
     this.cameraVfovDeg = opts.cameraVfovDeg;
     this.depthTranslation = opts.depthTranslation ?? true;
     this.standingBaseline = opts.torsoBaseline ?? null;
+    this.standingBases = opts.standingBases ?? null;
     this.analysis = opts.analysis;
     this.zFilter = new OneEuroFilter({ minCutoff: 1.0, beta: 0.5, dCutoff: 1.0 });
     this.xFilter = new OneEuroFilter({ minCutoff: 1.0, beta: 0.5, dCutoff: 1.0 });
 
     const hipsBone = opts.bones.hips ?? null;
     this.hipsParent = hipsBone?.parent ?? null;
-    if (hipsBone) hipsBone.updateWorldMatrix(true, false);
+    // Bind transforms are read from the nodes' local TRS (DESIGN §5.3 wrote them); refresh the world
+    // matrices of the whole skeleton from those locals so stale matrices never leak into rest data.
+    if (hipsBone) hipsBone.updateWorldMatrix(true, true);
 
     // Entries in parent-first order (canonical order, then verified against the hierarchy).
     const mapped = new Map<Object3D, HumanoidBone>();
@@ -262,6 +284,11 @@ export class Retargeter {
     for (const e of this.entries) e.childEntry = this.findChild(e);
     this.hips = this.byRole.get('hips') ?? null;
     this.buildTorsoChain();
+    for (const side of ['left', 'right'] as const) {
+      const shoulder = this.byRole.get(`${side}Shoulder`);
+      const upperArm = this.byRole.get(`${side}UpperArm`);
+      if (shoulder && upperArm) this.shoulderPairs.push({ shoulder, upperArm });
+    }
 
     const perRole: Partial<Record<HumanoidBone, SolveRoleResult>> = {};
     for (const e of this.entries) perRole[e.role] = e.out;
@@ -274,7 +301,39 @@ export class Retargeter {
       framing: 'none',
     };
     if (this.hips) this.result.hipsWorldPos.copy(this.hips.restPos);
+    this.measureLegs();
     this.rebuildReferences();
+  }
+
+  /** Vertical leg geometry of the rig (mean over the mapped sides; height-table fallbacks). */
+  private measureLegs(): void {
+    const ht = this.analysis.heightTable;
+    let legs = 0;
+    let legSum = 0;
+    let dropSum = 0;
+    let ankleSum = 0;
+    for (const side of ['left', 'right'] as const) {
+      const upper = this.byRole.get(`${side}UpperLeg`);
+      const foot = this.byRole.get(`${side}Foot`) ?? this.byRole.get(`${side}LowerLeg`);
+      if (!upper || !foot || !this.hips) continue;
+      let ankleY = foot.restPos.y;
+      if (foot.role !== `${side}Foot`) ankleY = foot.restPos.y + foot.restDir.y * Math.max(foot.length, 0);
+      const leg = upper.restPos.y - ankleY;
+      if (!(leg > 1e-3)) continue;
+      legs++;
+      legSum += leg;
+      dropSum += this.hips.restPos.y - upper.restPos.y;
+      ankleSum += ankleY;
+    }
+    if (legs > 0) {
+      this.modelLeg = legSum / legs;
+      this.hipJointDrop = dropSum / legs;
+      this.ankleRest = ankleSum / legs;
+    } else {
+      this.modelLeg = Math.max(ht.hips - ht.ankles, 1e-3);
+      this.hipJointDrop = 0;
+      this.ankleRest = ht.ankles;
+    }
   }
 
   // ------------------------------------------------------------------ setup
@@ -442,14 +501,68 @@ export class Retargeter {
         e.refU = null;
         continue;
       }
+      if (e.mode === 'auto') this.applyChordReference(e, ref);
       e.refD = ref.d;
       e.refU = ref.u;
       quatFromDirUp(ref.d, ref.u, _qa);
       const torsoLike = TORSO_BONES.includes(e.role);
-      if (torsoLike && e.mode !== 'calibrated') _qa.premultiply(this.t5);
+      if (torsoLike && e.mode !== 'calibrated') {
+        if (e.role === 'neck' || e.role === 'head') this.applyPitchBaseline(e.role, baseline, _qa);
+        _qa.premultiply(this.t5);
+      }
       e.qRefInv.copy(_qa).invert();
     }
     this.refsDirty = false;
+  }
+
+  /**
+   * No-knee / no-elbow chains (DESIGN §5.4, §6.2): the lower bone is driven
+   * from the chord (upper head -> end head), so its reference direction is the
+   * rig's bind chord rather than the bone's own direction; the upper bone
+   * follows. The up reference is re-orthogonalized against the chord.
+   */
+  private applyChordReference(e: RoleEntry, ref: { d: Vector3; u: Vector3 }): void {
+    const side = boneSide(e.role);
+    if (side === 'center') return;
+    let upper: HumanoidBone;
+    let end: HumanoidBone;
+    if (e.role === 'leftLowerLeg' || e.role === 'rightLowerLeg') {
+      if (!this.analysis.noKnee[side]) return;
+      upper = `${side}UpperLeg`;
+      end = `${side}Foot`;
+    } else if (e.role === 'leftLowerArm' || e.role === 'rightLowerArm') {
+      if (!this.analysis.noElbow[side]) return;
+      upper = `${side}UpperArm`;
+      end = `${side}Hand`;
+    } else return;
+    const up = this.byRole.get(upper);
+    if (!up) return;
+    const endEntry = this.byRole.get(end);
+    if (endEntry) _v1.copy(endEntry.restPos);
+    else _v1.copy(e.restPos).addScaledVector(e.restDir, Math.max(e.length, 1e-3));
+    _v1.sub(up.restPos);
+    if (_v1.lengthSq() < 1e-8) return;
+    ref.d.copy(_v1.normalize());
+    ref.u.addScaledVector(ref.d, -ref.u.dot(ref.d));
+    if (ref.u.lengthSq() < 1e-8) canonicalUpMinRotated(e.role, ref.d, ref.u);
+    ref.u.normalize();
+  }
+
+  /**
+   * Folds the standing pitch of the neck/head (relative to the torso
+   * baseline, about the lateral axis only, so the head's yaw and roll during
+   * the baseline window are not baked in) into the reference frame `q`.
+   */
+  private applyPitchBaseline(role: HumanoidBone, torso: RefBasisRecord, q: Quaternion): void {
+    const sb = this.standingBases?.[role];
+    if (!sb) return;
+    quatFromDirUp(_v1.fromArray(torso.d), _v2.fromArray(torso.u), _qb);
+    quatFromDirUp(_v1.fromArray(sb.d), _v2.fromArray(sb.u), _qc);
+    if (_v1.lengthSq() < 1e-8) return;
+    // Standing basis expressed in the torso frame (x = up, y = lateral, z = forward).
+    _qRel.copy(_qb).invert().multiply(_qc);
+    swingTwist(_qRel, _LATERAL, _qSwing, _qTwist);
+    q.multiply(_qTwist);
   }
 
   // --------------------------------------------------------------- settings
@@ -475,6 +588,12 @@ export class Retargeter {
   /** Standing baseline from `StandingBaseline` (ignored when the calibration carries one). */
   setTorsoBaseline(baseline: RefBasisRecord | null): void {
     this.standingBaseline = baseline;
+    this.refsDirty = true;
+  }
+
+  /** Standing neck/head bases from `StandingBaseline` (pitch correction for `relative` mode). */
+  setStandingBases(bases: Partial<Record<HumanoidBone, RefBasisRecord>> | null): void {
+    this.standingBases = bases;
     this.refsDirty = true;
   }
 
@@ -685,10 +804,9 @@ export class Retargeter {
   }
 
   private combineShoulders(): void {
-    for (const side of ['left', 'right'] as const) {
-      const sh = this.byRole.get(`${side}Shoulder`);
-      const ua = this.byRole.get(`${side}UpperArm`);
-      if (!sh || !ua || !sh.driven || !ua.driven) continue;
+    for (let i = 0; i < this.shoulderPairs.length; i++) {
+      const { shoulder: sh, upperArm: ua } = this.shoulderPairs[i];
+      if (!sh.driven || !ua.driven) continue;
       _qa.copy(IDENTITY).slerp(ua.swing, SHOULDER_SWING_FRACTION);
       sh.rPrime.premultiply(_qa);
     }
@@ -786,7 +904,9 @@ export class Retargeter {
     if (present && W > 0 && H > 0) {
       let n = 0;
       let wsum = 0;
-      for (const [i, j] of DEPTH_SEGMENTS) {
+      for (let k = 0; k < DEPTH_SEGMENTS.length; k++) {
+        const i = DEPTH_SEGMENTS[k][0];
+        const j = DEPTH_SEGMENTS[k][1];
         if (!pose.gated[i] || !pose.gated[j] || !pose.inFrame[i] || !pose.inFrame[j]) continue;
         if (pose.confidence[i] <= 0 || pose.confidence[j] <= 0) continue;
         const a = pose.world[i];
@@ -859,21 +979,21 @@ export class Retargeter {
       const ar = LM.RIGHT_ANKLE;
       const anklesOk =
         this.hipsMode === 'full' && state === 'full' && pose.gated[al] && pose.gated[ar] && pose.inFrame[al] && pose.inFrame[ar];
-      const ht = this.analysis.heightTable;
-      const modelHips = Math.max(ht.hips - ht.floor, 1e-3);
+      // The user's hips-above-ankles height (leg extension) maps onto the rig's thigh-head-to-ankle length.
       if (anklesOk) {
         const hipsHeight = -Math.min(pose.world[al].y, pose.world[ar].y);
         if (!Number.isFinite(this.standingMax) || hipsHeight > this.standingMax) this.standingMax = hipsHeight;
         else this.standingMax = Math.max(hipsHeight, this.standingMax - STANDING_MAX_DECAY * dt);
-        const s = modelHips / Math.max(this.standingMax, 1e-3);
+        const s = this.modelLeg / Math.max(this.standingMax, 1e-3);
         const measured = (hipsHeight - this.standingMax) * s;
         this.verticalBlend = Math.min(1, this.verticalBlend + dt / VERTICAL_BLEND_SEC);
         this.verticalOffset = this.heldVertical + (measured - this.heldVertical) * this.verticalBlend;
         if (this.verticalBlend >= 1) this.heldVertical = measured;
         let y = rest.y + this.verticalOffset;
-        // Floor clamp: the lowest foot never goes below the floor.
-        const footY = y - hipsHeight * s;
-        if (footY < ht.floor) y = ht.floor + hipsHeight * s;
+        // Floor clamp: the predicted ankle (thigh heads sit `hipJointDrop` below the hips bone) never goes
+        // below its rest height above the floor, so the soles stay on the floor.
+        const ankleY = y - this.hipJointDrop - hipsHeight * s;
+        if (ankleY < this.ankleRest) y = this.ankleRest + this.hipJointDrop + hipsHeight * s;
         this.hipsTarget.y = y;
       } else {
         this.heldVertical = this.verticalOffset;
@@ -923,9 +1043,17 @@ export class Retargeter {
     ce.rightLeg = this.chainError('rightUpperLeg', 'rightLowerLeg', 'rightFoot', J[LM.RIGHT_HIP], J[LM.RIGHT_ANKLE], result.bases.rightUpperLeg);
   }
 
-  /** Actual world direction of a bone from the solver's world chain (child position minus bone position). */
+  /**
+   * Actual world direction of a bone from the solver's world chain (child
+   * position minus bone position). A chord-driven bone (no-knee / no-elbow)
+   * reports the rig chord from its parent's head, which is what it was driven to.
+   */
   private solvedDirection(e: RoleEntry, out: Vector3): Vector3 {
     const child = e.childEntry;
+    if (e.source === 'chord' && child && e.parent) {
+      out.setFromMatrixPosition(child.mNow).sub(_v1.setFromMatrixPosition(e.parent.mNow));
+      if (out.lengthSq() > 1e-10) return out.normalize();
+    }
     if (child) {
       out.setFromMatrixPosition(child.mNow).sub(_v1.setFromMatrixPosition(e.mNow));
       if (out.lengthSq() > 1e-10) return out.normalize();
@@ -1033,6 +1161,11 @@ const _qLT = new Quaternion();
 const _qPinv = new Quaternion();
 const _qa = new Quaternion();
 const _qb = new Quaternion();
+const _qc = new Quaternion();
+const _qRel = new Quaternion();
+const _qSwing = new Quaternion();
+const _qTwist = new Quaternion();
+const _LATERAL = new Vector3(0, 1, 0);
 const _v1 = new Vector3();
 const _v2 = new Vector3();
 const _v3 = new Vector3();

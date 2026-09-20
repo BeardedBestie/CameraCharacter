@@ -49,27 +49,58 @@ export function toBasisRecord(d: Vector3, u: Vector3): RefBasisRecord {
   return { d: [dn.x, dn.y, dn.z], u: [un.x, un.y, un.z] };
 }
 
+/** Component samples of a unit basis, reduced to a component-wise median. */
+class BasisSamples {
+  readonly dx: number[] = [];
+  readonly dy: number[] = [];
+  readonly dz: number[] = [];
+  readonly ux: number[] = [];
+  readonly uy: number[] = [];
+  readonly uz: number[] = [];
+  push(b: MeasuredBasis): void {
+    this.dx.push(b.d.x);
+    this.dy.push(b.d.y);
+    this.dz.push(b.d.z);
+    this.ux.push(b.u.x);
+    this.uy.push(b.u.y);
+    this.uz.push(b.u.z);
+  }
+  get size(): number {
+    return this.dx.length;
+  }
+  record(fallbackD: Vector3, fallbackU: Vector3): RefBasisRecord {
+    const d = medianVector(this.dx, this.dy, this.dz, fallbackD);
+    const u = medianVector(this.ux, this.uy, this.uz, fallbackU);
+    return toBasisRecord(d, u);
+  }
+  clear(): void {
+    for (const a of [this.dx, this.dy, this.dz, this.ux, this.uy, this.uz]) a.length = 0;
+  }
+}
+
+/** Roles besides the torso whose standing basis is recorded (pitch reference for `relative` mode). */
+export const STANDING_BASIS_ROLES: readonly HumanoidBone[] = ['neck', 'head'];
+
 /**
- * Standing baseline: the median torso basis and segment medians over the
- * first `standingBaselineSec` seconds of confident full-body tracking.
+ * Standing baseline: the median torso basis, the median neck/head bases and
+ * the segment medians over the first `standingBaselineSec` seconds of
+ * confident full-body tracking.
  */
 export class StandingBaseline {
   private settings: SmoothingSettings;
   private accumulated = 0;
-  private readonly dx: number[] = [];
-  private readonly dy: number[] = [];
-  private readonly dz: number[] = [];
-  private readonly ux: number[] = [];
-  private readonly uy: number[] = [];
-  private readonly uz: number[] = [];
+  private readonly torsoSamples = new BasisSamples();
+  private readonly roleSamples = new Map<HumanoidBone, BasisSamples>();
   private readonly zSamples: number[] = [];
   private ready = false;
   private baseline: RefBasisRecord | null = null;
+  private bases: Partial<Record<HumanoidBone, RefBasisRecord>> = {};
   private segments: Partial<Record<SegmentName, number>> = {};
   private zRefValue: number | null = null;
 
   constructor(settings: SmoothingSettings) {
     this.settings = settings;
+    for (const r of STANDING_BASIS_ROLES) this.roleSamples.set(r, new BasisSamples());
   }
 
   setSettings(settings: SmoothingSettings): void {
@@ -83,6 +114,11 @@ export class StandingBaseline {
   /** Median torso basis (d = up, u = forward) once ready, else null. */
   get torsoBaseline(): RefBasisRecord | null {
     return this.baseline;
+  }
+
+  /** Median standing bases of the neck and head (roles with enough confident samples), once ready. */
+  get standingBases(): Partial<Record<HumanoidBone, RefBasisRecord>> {
+    return this.bases;
   }
 
   get segmentLengths(): Partial<Record<SegmentName, number>> {
@@ -113,18 +149,20 @@ export class StandingBaseline {
       const b = result.bases[l];
       if (!b || b.c < BASELINE_MIN_CONFIDENCE) return;
     }
-    this.dx.push(hips.d.x);
-    this.dy.push(hips.d.y);
-    this.dz.push(hips.d.z);
-    this.ux.push(hips.u.x);
-    this.uy.push(hips.u.y);
-    this.uz.push(hips.u.z);
+    this.torsoSamples.push(hips);
+    for (const [role, samples] of this.roleSamples) {
+      const b = result.bases[role];
+      if (b && b.c >= BASELINE_MIN_CONFIDENCE && b.source === 'measured') samples.push(b);
+    }
     if (depthZ !== null && Number.isFinite(depthZ)) this.zSamples.push(depthZ);
     this.accumulated += Math.max(dt, 0);
-    if (this.accumulated >= this.settings.standingBaselineSec && this.dx.length >= 5) {
-      const d = medianVector(this.dx, this.dy, this.dz, new Vector3(0, 1, 0));
-      const u = medianVector(this.ux, this.uy, this.uz, new Vector3(0, 0, 1));
-      this.baseline = toBasisRecord(d, u);
+    if (this.accumulated >= this.settings.standingBaselineSec && this.torsoSamples.size >= 5) {
+      this.baseline = this.torsoSamples.record(new Vector3(0, 1, 0), new Vector3(0, 0, 1));
+      const bases: Partial<Record<HumanoidBone, RefBasisRecord>> = {};
+      for (const [role, samples] of this.roleSamples) {
+        if (samples.size >= 5) bases[role] = samples.record(new Vector3(0, 1, 0), new Vector3(0, 0, 1));
+      }
+      this.bases = bases;
       this.segments = { ...result.segmentLengths };
       this.zRefValue = this.zSamples.length ? median(this.zSamples) : null;
       this.ready = true;
@@ -133,9 +171,12 @@ export class StandingBaseline {
 
   reset(): void {
     this.accumulated = 0;
-    for (const a of [this.dx, this.dy, this.dz, this.ux, this.uy, this.uz, this.zSamples]) a.length = 0;
+    this.torsoSamples.clear();
+    for (const s of this.roleSamples.values()) s.clear();
+    this.zSamples.length = 0;
     this.ready = false;
     this.baseline = null;
+    this.bases = {};
     this.segments = {};
     this.zRefValue = null;
   }

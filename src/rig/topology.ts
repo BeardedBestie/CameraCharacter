@@ -23,7 +23,7 @@ import {
   type BoneNameInfo,
   type FingerDigit,
 } from './boneNames';
-import { lca, pathDown, type SkeletonGraph } from './skeletonGraph';
+import { isDescendant, lca, pathDown, type SkeletonGraph } from './skeletonGraph';
 
 export type NodeKind = 'link' | 'passthrough' | 'marker';
 export type LimbSide = 'left' | 'right';
@@ -163,6 +163,7 @@ class Ctx {
       else if (inf.group === 'ignore') kind = 'passthrough';
       else if (hasJoints && !nd.isJoint) kind = 'passthrough';
       else if (defOnly && !nd.name.startsWith('DEF-')) kind = 'passthrough';
+      else if (g.hasSkinWeights && !(nd.weight > 0) && nd.children.length === 0 && inf.group === 'unknown') kind = 'marker';
       // Effective parent: nearest link ancestor.
       let p = nd.parent;
       while (p >= 0 && this.kinds[p] !== 'link') p = g.nodes[p].parent;
@@ -327,21 +328,28 @@ function estimateAxes(ctx: Ctx, forcedUp: Vector3 | null): AxisEstimate {
   };
   const extent = Math.max(extentAlong(AXES[0]), extentAlong(AXES[1]), extentAlong(AXES[2]), 1e-9);
 
-  // Mirror symmetry score for a candidate normal (mean nearest-neighbour distance of the mirrored cloud).
+  // Mirror symmetry score for a candidate normal: mean nearest-neighbour
+  // distance of the mirrored cloud over the points that are displaced from
+  // the mirror plane (a thin axis, e.g. the depth of a flat T-pose, has too
+  // few displaced points to count as a bilateral symmetry).
   const symmetryError = (n: Vector3): number => {
     let total = 0;
+    let count = 0;
     const q = new Vector3();
     for (const p of pts) {
-      const s = 2 * p.clone().sub(c).dot(n);
-      q.copy(p).addScaledVector(n, -s);
+      const s = p.clone().sub(c).dot(n);
+      if (Math.abs(s) < 0.05 * extent) continue;
+      q.copy(p).addScaledVector(n, -2 * s);
       let best = Infinity;
       for (const r of pts) {
         const dd = q.distanceToSquared(r);
         if (dd < best) best = dd;
       }
       total += Math.sqrt(best);
+      count++;
     }
-    return total / pts.length / extent;
+    if (count < 0.2 * pts.length) return Infinity;
+    return total / count / extent;
   };
 
   const pca = eigen3(cov);
@@ -374,55 +382,122 @@ function estimateAxes(ctx: Ctx, forcedUp: Vector3 | null): AxisEstimate {
       if (snap.snapped) up = snap.axis;
       else warnings.push('Topology: the rig up axis is not aligned with a principal axis; using the estimated axis as-is.');
     }
-    // Sign: the extreme leaf on the mid-plane is the head; paired, laterally displaced extremes are the feet.
-    const xMid = median(pts.map((p) => p.dot(lateral)));
-    // Link leaves only: markers can be misplaced (a head_end sitting at the floor in one bundled file).
-    const leafIdx = idx.filter((i) => ctx.kinds[i] === 'link' && ctx.effChildren[i].length === 0);
-    const leafPts = leafIdx.length >= 2 ? leafIdx.map((i) => ctx.pos[i]) : pts;
-    let hi = -Infinity;
-    let lo = Infinity;
-    for (const p of leafPts) {
-      const h = p.dot(up);
-      if (h > hi) hi = h;
-      if (h < lo) lo = h;
-    }
-    const band = 0.1 * extent;
-    let topLat = 0;
-    let botLat = 0;
-    let topMin = Infinity;
-    let botMin = Infinity;
-    for (const p of leafPts) {
-      const h = p.dot(up);
-      const lat = Math.abs(p.dot(lateral) - xMid);
-      if (h >= hi - band) {
-        topLat = Math.max(topLat, lat);
-        topMin = Math.min(topMin, lat);
-      }
-      if (h <= lo + band) {
-        botLat = Math.max(botLat, lat);
-        botMin = Math.min(botMin, lat);
-      }
-    }
-    const centered = 0.04 * extent;
-    let flip = false;
-    if (topMin < centered !== botMin < centered) {
-      // The head sits on the mid-plane; the feet come as a laterally displaced pair.
-      flip = botMin < centered;
-    } else if (Math.abs(topLat - botLat) > 0.02 * extent) {
-      // Headless: hands reach further sideways than feet, so the more lateral extremes are up.
-      flip = botLat > topLat;
-    } else {
-      // Tie: more nodes live in the upper half (arms, fingers, head).
-      const mid = 0.5 * (hi + lo);
-      let above = 0;
-      for (const p of pts) if (p.dot(up) > mid) above++;
-      flip = above < pts.length - above;
-    }
-    if (flip) up.negate();
+    if (resolveUpSign(ctx, up, lateral, extentAlong(up))) up.negate();
   }
   // Keep the lateral axis perpendicular to up.
   lateral.addScaledVector(up, -lateral.dot(up)).normalize();
   return { up, lateral, height: extentAlong(up), warnings };
+}
+
+interface LeafPair {
+  a: number;
+  b: number;
+  lca: number;
+  /** Shorter of the two chain lengths from the common ancestor. */
+  length: number;
+}
+
+/**
+ * Mirrored pairs of leaf chains: two link leaves mirrored across the lateral
+ * axis (|x_a + x_b| < 0.15·height, |x_a − x_b| ≥ 0.04·height) whose paths
+ * from their common ancestor each have ≥ 2 links and ≥ 0.25·height of chain.
+ * Legs, arms and finger/toe chains qualify; skirts, tails, breasts, eyes and
+ * one-link helpers do not.
+ */
+function mirroredLeafPairs(ctx: Ctx, lateral: Vector3, height: number): LeafPair[] {
+  const leaves = ctx.leaves();
+  const allLinkPts = ctx.pos.filter((_, i) => ctx.isLink(i));
+  const xMid = median(allLinkPts.map((p) => p.dot(lateral)));
+  const x = (i: number) => ctx.pos[i].dot(lateral) - xMid;
+  const chainStats = (top: number, leaf: number): { links: number; length: number } => {
+    let links = 0;
+    let length = 0;
+    let prev = top;
+    for (const i of pathDown(ctx.g, top, leaf)) {
+      if (!ctx.isLink(i)) continue;
+      links++;
+      length += ctx.pos[i].distanceTo(ctx.pos[prev]);
+      prev = i;
+    }
+    return { links, length };
+  };
+  const pairs: LeafPair[] = [];
+  for (let i = 0; i < leaves.length; i++) {
+    for (let j = i + 1; j < leaves.length; j++) {
+      const a = leaves[i];
+      const b = leaves[j];
+      if (Math.abs(x(a) + x(b)) >= 0.15 * height) continue;
+      if (Math.abs(x(a) - x(b)) < 0.04 * height) continue;
+      const l = lca(ctx.g, [a, b]);
+      if (l < 0 || l === a || l === b) continue;
+      const sa = chainStats(l, a);
+      const sb = chainStats(l, b);
+      if (sa.links < 2 || sb.links < 2) continue;
+      if (sa.length < 0.25 * height || sb.length < 0.25 * height) continue;
+      pairs.push({ a, b, lca: l, length: Math.min(sa.length, sb.length) });
+    }
+  }
+  return pairs;
+}
+
+/**
+ * Whether the unsigned up axis must be negated. Topological rule first: among
+ * the mirrored leaf-chain pairs, the legs are the pair whose common ancestor
+ * (the hips) is an ancestor of every other pair's ancestor (the arms branch
+ * off the spine, above the hips); down = feet − hips. Falls back to leaf
+ * clustering (a centered head leaf at one end, paired feet at the other; then
+ * the end with more leaves; then the half with more nodes) when the pairs do
+ * not separate (arms attached directly to the hips, no arms, ...).
+ */
+function resolveUpSign(ctx: Ctx, up: Vector3, lateral: Vector3, extent: number): boolean {
+  const pairs = mirroredLeafPairs(ctx, lateral, Math.max(extent, 1e-9));
+  if (pairs.length) {
+    const lcas = [...new Set(pairs.map((p) => p.lca))];
+    const rootMost = lcas.find((l) => lcas.every((m) => m === l || isDescendant(ctx.g, m, l)));
+    if (rootMost !== undefined && lcas.length > 1) {
+      let legPair = pairs[0];
+      for (const p of pairs) if (p.lca === rootMost && (legPair.lca !== rootMost || p.length > legPair.length)) legPair = p;
+      if (legPair.lca === rootMost) {
+        const feet = ctx.pos[legPair.a].clone().add(ctx.pos[legPair.b]).multiplyScalar(0.5);
+        const down = feet.sub(ctx.pos[rootMost]);
+        if (Math.abs(down.dot(up)) > 0.05 * extent) return down.dot(up) > 0;
+      }
+    }
+  }
+  // Fallback: leaf clustering.
+  const pts: Vector3[] = [];
+  for (let i = 0; i < ctx.g.nodes.length; i++) if (ctx.kinds[i] !== 'passthrough') pts.push(ctx.pos[i]);
+  const xMid = median(pts.map((p) => p.dot(lateral)));
+  const leafIdx: number[] = [];
+  for (let i = 0; i < ctx.g.nodes.length; i++) if (ctx.kinds[i] === 'link' && ctx.effChildren[i].length === 0) leafIdx.push(i);
+  const leafPts = leafIdx.length >= 2 ? leafIdx.map((i) => ctx.pos[i]) : pts;
+  let hi = -Infinity;
+  let lo = Infinity;
+  for (const p of leafPts) {
+    const h = p.dot(up);
+    if (h > hi) hi = h;
+    if (h < lo) lo = h;
+  }
+  const band = 0.1 * extent;
+  let topMin = Infinity;
+  let botMin = Infinity;
+  let above = 0;
+  let below = 0;
+  const mid = 0.5 * (hi + lo);
+  for (const p of leafPts) {
+    const h = p.dot(up);
+    const lat = Math.abs(p.dot(lateral) - xMid);
+    if (h >= hi - band) topMin = Math.min(topMin, lat);
+    if (h <= lo + band) botMin = Math.min(botMin, lat);
+    if (h > mid) above++;
+    else if (h < mid) below++;
+  }
+  const centered = 0.03 * extent;
+  if (topMin < centered !== botMin < centered) return botMin < centered;
+  if (above !== below) return below > above;
+  let nodesAbove = 0;
+  for (const p of pts) if (p.dot(up) > mid) nodesAbove++;
+  return nodesAbove < pts.length - nodesAbove;
 }
 
 // ---------------------------------------------------------------------------
@@ -698,28 +773,15 @@ export function analyzeTopology(graph: SkeletonGraph, opts: TopologyOptions = {}
   result.height = height;
 
   // ---------------------------------------------------------------- feet
+  // The lowest mirrored pair of leaf chains (>= 2 links, >= 0.25·height from
+  // the common ancestor: drops skirts, tails, heel helpers; individual toe
+  // chains still find the feet because the chain is measured from the pair's
+  // common ancestor).
   const leaves = ctx.leaves();
-  const footCands = leaves.filter((l) => {
-    const lc = ctx.leafChain(l);
-    return lc.links >= 2 && lc.length >= 0.25 * height;
-  });
-  footCands.sort((a, b) => h(a) - h(b));
   let footA = -1;
   let footB = -1;
   {
-    type P = { a: number; b: number; top: number };
-    const pairs: P[] = [];
-    for (let i = 0; i < footCands.length; i++) {
-      for (let j = i + 1; j < footCands.length; j++) {
-        const a = footCands[i];
-        const b = footCands[j];
-        if (Math.abs(x(a) + x(b)) >= 0.15 * height) continue;
-        if (Math.abs(x(a) - x(b)) < 0.04 * height) continue;
-        const l = lca(graph, [a, b]);
-        if (l < 0 || l === a || l === b) continue;
-        pairs.push({ a, b, top: Math.max(h(a), h(b)) });
-      }
-    }
+    const pairs = mirroredLeafPairs(ctx, lateral, height).map((p) => ({ ...p, top: Math.max(h(p.a), h(p.b)) }));
     pairs.sort((p, q) => p.top - q.top);
     if (pairs.length) {
       footA = pairs[0].a;
@@ -1032,8 +1094,24 @@ export function analyzeTopology(graph: SkeletonGraph, opts: TopologyOptions = {}
     }
     if (links.length) {
       let head = -1;
-      for (const i of links) if (ctx.info[i].group === 'torso' && ctx.info[i].keyword !== null && HEAD_TOKENS.has(ctx.info[i].keyword!)) head = i;
+      // The link named `head`: exactly the head token (Head, J_Bip_C_Head, CC_Base_Head)
+      // or a head-class link that carries skin weight; a zero-weight leaf such as
+      // the Meshy `headfront` marker never wins over its parent.
+      const namedHead = (i: number): boolean => {
+        const inf = ctx.info[i];
+        if (inf.group !== 'torso' || inf.keyword === null || !HEAD_TOKENS.has(inf.keyword)) return false;
+        if (inf.tokens.length === 1) return true;
+        const nd = graph.nodes[i];
+        return !graph.hasSkinWeights || nd.weight > 0;
+      };
+      for (const i of links) {
+        if (namedHead(i)) {
+          head = i;
+          break;
+        }
+      }
       if (head < 0) {
+        // Else the last link before facial/hair branching.
         for (const i of links) if (ctx.effChildren[i].length >= 2) head = i;
       }
       if (head < 0) {

@@ -13,7 +13,7 @@ import {
   standingPose,
 } from '../../src/testing/syntheticHuman';
 import { degrees, filteredFromFrame, SMOOTHING } from './helpers';
-import { angleBetween } from '../../src/core/math';
+import { DEG2RAD, angleBetween, perpendicularComponent } from '../../src/core/math';
 
 const OPTS: BodyModelOptions = { framing: 'full', noKnee: { left: false, right: false }, noElbow: { left: false, right: false }, mirror: false };
 const DT = 1 / 30;
@@ -35,9 +35,18 @@ describe('BodyModel measured bases', () => {
     expect(angleDeg(r.torso.hips.d, new Vector3(0, 1, 0))).toBeLessThan(0.5);
     expect(angleDeg(r.torso.hips.u, new Vector3(0, 0, 1))).toBeLessThan(0.5);
     expect(angleDeg(r.torso.shoulders.u, new Vector3(0, 0, 1))).toBeLessThan(0.5);
-    expect(angleDeg(b.head!.d, new Vector3(0, 1, 0))).toBeLessThan(2);
-    expect(angleDeg(b.head!.u, new Vector3(0, 0, 1))).toBeLessThan(2);
+    // Head (DESIGN §6.1): forward = midEye - midEar orthogonalized against the ear axis, up = cross(ear axis, forward).
+    // The synthetic eyes sit 3 cm above the ears, so the raw basis is pitched back by atan(0.03/0.08) = 20.6°;
+    // it lies in the sagittal plane with zero yaw and the solver's standing baseline levels it (solver tests).
+    const headPitch = degrees(Math.atan2(0.03, 0.08));
+    expect(angleDeg(b.head!.d, new Vector3(0, Math.cos(headPitch * DEG2RAD), -Math.sin(headPitch * DEG2RAD)))).toBeLessThan(1);
+    expect(angleDeg(b.head!.u, new Vector3(0, Math.sin(headPitch * DEG2RAD), Math.cos(headPitch * DEG2RAD)))).toBeLessThan(1);
+    expect(Math.abs(b.head!.d.dot(b.head!.u))).toBeLessThan(1e-6);
+    expect(Math.abs(b.head!.u.x)).toBeLessThan(1e-3); // no yaw
+    expect(b.head!.c).toBeGreaterThan(0.9);
     expect(angleDeg(b.neck!.d, new Vector3(0, 1, 0))).toBeLessThan(2);
+    // The neck's up reference is the head forward; its component perpendicular to the neck is +Z.
+    expect(angleDeg(perpendicularComponent(b.neck!.u, b.neck!.d)!, new Vector3(0, 0, 1))).toBeLessThan(1);
     // Palms down: the dorsal normal points up on both sides.
     expect(angleDeg(b.leftLowerArm!.u, new Vector3(0, 1, 0))).toBeLessThan(1);
     expect(angleDeg(b.rightLowerArm!.u, new Vector3(0, 1, 0))).toBeLessThan(1);

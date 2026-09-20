@@ -120,8 +120,10 @@ describe('framing fit', () => {
     const pts = computeLandmarkPositions(standingPose({}));
     // Distances that put the visible span slightly around the full boundary.
     const frames = [];
+    // With a 60° vertical FOV the full boundary (span 0.85) sits near 1.29 m: 1.32 m gives ~0.87,
+    // 1.28 m ~0.84, both sides of the boundary but inside the ±0.05 hysteresis band.
     for (let i = 0; i < 90; i++) {
-      const z = i % 2 ? 2.35 : 2.2; // both sides of the boundary within the hysteresis band
+      const z = i % 2 ? 1.28 : 1.32;
       frames.push(toPoseFrame(pts, cameraAt(z, 1.0), i * DT * 1000));
     }
     const { states, fits } = run(frames);

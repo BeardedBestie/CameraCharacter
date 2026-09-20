@@ -297,6 +297,9 @@ interface LimbFallback {
 }
 
 const SEGMENT_NAMES: readonly SegmentName[] = ['upperArm', 'lowerArm', 'upperLeg', 'lowerLeg', 'shoulderWidth', 'hipWidth', 'torso'];
+const SIDES: readonly ('left' | 'right')[] = ['left', 'right'];
+const EMPTY_CONF: number[] = [];
+const EMPTY_GATED: boolean[] = [];
 
 export class BodyModel {
   private settings: SmoothingSettings;
@@ -310,6 +313,10 @@ export class BodyModel {
   private hipsLostFor = 0;
   private readonly pelvisAtLoss = makeBasis();
   private pelvisEver = false;
+  // per-frame inputs (set by update(); no closures are allocated on the hot path)
+  private present = false;
+  private cf: number[] = EMPTY_CONF;
+  private gatedArr: boolean[] = EMPTY_GATED;
 
   // scratch
   private readonly midHip = new Vector3();
@@ -402,15 +409,24 @@ export class BodyModel {
     return m.size >= MIN_SEGMENT_SAMPLES ? m.value() : NaN;
   }
 
+  /** Confidence of a landmark in the current frame (0 when no subject is present). */
+  private conf(i: number): number {
+    return this.present ? this.cf[i] ?? 0 : 0;
+  }
+
+  /** Whether a landmark's gate is open in the current frame. */
+  private isGated(i: number): boolean {
+    return this.present && !!this.gatedArr[i];
+  }
+
   update(pose: FilteredPose, dt: number, opts: BodyModelOptions): BodyModelResult {
     const R = this.result;
     const W = pose.world;
-    const cf = pose.confidence;
-    const gated = pose.gated;
     const framing = opts.framing;
     const present = pose.present && W.length >= POSE_LANDMARK_COUNT;
-    const conf = (i: number): number => (present ? cf[i] ?? 0 : 0);
-    const isGated = (i: number): boolean => present && !!gated[i];
+    this.present = present;
+    this.cf = pose.confidence;
+    this.gatedArr = pose.gated;
 
     for (let i = 0; i < POSE_LANDMARK_COUNT; i++) {
       if (present) R.joints[i].copy(W[i]);
@@ -437,9 +453,9 @@ export class BodyModel {
     else this.hipFwd.normalize();
 
     const ignoreBelowShoulders = framing === 'bust' || framing === 'face';
-    const shoulderConf = Math.min(conf(LM.LEFT_SHOULDER), conf(LM.RIGHT_SHOULDER));
-    let hipsConf = Math.min(conf(LM.LEFT_HIP), conf(LM.RIGHT_HIP));
-    if (ignoreBelowShoulders || !isGated(LM.LEFT_HIP) || !isGated(LM.RIGHT_HIP)) hipsConf = 0;
+    const shoulderConf = Math.min(this.conf(LM.LEFT_SHOULDER), this.conf(LM.RIGHT_SHOULDER));
+    let hipsConf = Math.min(this.conf(LM.LEFT_HIP), this.conf(LM.RIGHT_HIP));
+    if (ignoreBelowShoulders || !this.isGated(LM.LEFT_HIP) || !this.isGated(LM.RIGHT_HIP)) hipsConf = 0;
     const hipsLost = hipsConf <= 0;
     R.hipsConfidence = hipsConf;
     R.hipsLost = hipsLost;
@@ -496,28 +512,22 @@ export class BodyModel {
     }
 
     // ----------------------------------------------------------- neck / head
-    this.neckHead(pose, dt, framing, present, conf, isGated);
+    this.neckHead(pose, dt, framing, present);
 
     // ----------------------------------------------------------------- limbs
     const armsRelax = framing === 'face';
     const legsRelax = framing === 'waist' || framing === 'bust' || framing === 'face';
-    for (const side of ['left', 'right'] as const) {
-      this.arm(side, dt, conf, isGated, pose, armFwd, opts.noElbow[side], armsRelax);
-      this.leg(side, dt, conf, isGated, legFwd, opts.noKnee[side], legsRelax);
+    for (let k = 0; k < SIDES.length; k++) {
+      const side = SIDES[k];
+      this.arm(side, dt, pose, armFwd, opts.noElbow[side], armsRelax);
+      this.leg(side, dt, legFwd, opts.noKnee[side], legsRelax);
     }
     return R;
   }
 
   // --------------------------------------------------------------------------
 
-  private neckHead(
-    pose: FilteredPose,
-    dt: number,
-    framing: FramingState,
-    present: boolean,
-    conf: (i: number) => number,
-    isGated: (i: number) => boolean,
-  ): void {
+  private neckHead(pose: FilteredPose, dt: number, framing: FramingState, present: boolean): void {
     const J = this.result.joints;
     const faceRot = pose.face?.rotation ?? null;
     // Landmark head basis.
@@ -540,7 +550,7 @@ export class BodyModel {
         }
       }
     }
-    const lmHeadConf = Math.min(conf(LM.LEFT_EAR), conf(LM.RIGHT_EAR), conf(LM.LEFT_EYE), conf(LM.RIGHT_EYE));
+    const lmHeadConf = Math.min(this.conf(LM.LEFT_EAR), this.conf(LM.RIGHT_EAR), this.conf(LM.LEFT_EYE), this.conf(LM.RIGHT_EYE));
     // The FaceLandmarker matrix replaces the landmark head basis whenever it is present.
     const useFace = faceRot !== null;
     if (faceRot !== null) {
@@ -549,8 +559,8 @@ export class BodyModel {
     }
     const headConf = useFace ? 1 : headOk ? lmHeadConf : 0;
     // Neck: midShoulder -> midEar, u = head forward.
-    const neckGated = isGated(LM.LEFT_SHOULDER) && isGated(LM.RIGHT_SHOULDER) && isGated(LM.LEFT_EAR) && isGated(LM.RIGHT_EAR);
-    let neckConf = Math.min(conf(LM.LEFT_SHOULDER), conf(LM.RIGHT_SHOULDER), conf(LM.LEFT_EAR), conf(LM.RIGHT_EAR));
+    const neckGated = this.isGated(LM.LEFT_SHOULDER) && this.isGated(LM.RIGHT_SHOULDER) && this.isGated(LM.LEFT_EAR) && this.isGated(LM.RIGHT_EAR);
+    let neckConf = Math.min(this.conf(LM.LEFT_SHOULDER), this.conf(LM.RIGHT_SHOULDER), this.conf(LM.LEFT_EAR), this.conf(LM.RIGHT_EAR));
     this._solved.subVectors(this._b, this.midShoulder);
     let neckD: Vector3 = this._solved;
     if (framing === 'face' && useFace) {
@@ -566,37 +576,28 @@ export class BodyModel {
     this.finish('head', 'torso', dt, headUp, headFwd, headConf, headConf, 'measured');
   }
 
-  private arm(
-    side: 'left' | 'right',
-    dt: number,
-    conf: (i: number) => number,
-    isGated: (i: number) => boolean,
-    pose: FilteredPose,
-    torsoFwd: Vector3,
-    noElbow: boolean,
-    forcedRelax: boolean,
-  ): void {
+  private arm(side: 'left' | 'right', dt: number, pose: FilteredPose, torsoFwd: Vector3, noElbow: boolean, forcedRelax: boolean): void {
     const L = IDX[side];
     const roles = ROLES[side];
     const J = this.result.joints;
     const S = J[L.shoulder];
     const E = J[L.elbow];
     const Wr = J[L.wrist];
-    const cS = conf(L.shoulder);
-    const cE = conf(L.elbow);
-    const cW = conf(L.wrist);
+    const cS = this.conf(L.shoulder);
+    const cE = this.conf(L.elbow);
+    const cW = this.conf(L.wrist);
     const fb = this.limbs[side === 'left' ? 'leftArm' : 'rightArm'];
     const bend = this.bends.get(roles.upperArm)!;
 
     // ------------------------------------------------ elbow (with fallback)
-    const elbowUsable = isGated(L.elbow) && cE > 0;
+    const elbowUsable = this.isGated(L.elbow) && cE > 0;
     let c = Math.min(cS, cE);
     let source: BasisSource = 'measured';
     if (!elbowUsable) fb.lostFor += dt;
     if (!elbowUsable || cE < AMBIGUOUS_CONF) {
       const L1 = this.segmentLength('upperArm');
       const L2 = this.segmentLength('lowerArm');
-      if (isGated(L.shoulder) && isGated(L.wrist) && Number.isFinite(L1) && Number.isFinite(L2)) {
+      if (this.isGated(L.shoulder) && this.isGated(L.wrist) && Number.isFinite(L1) && Number.isFinite(L2)) {
         this._a.subVectors(Wr, S);
         const D = this._a.length();
         const r = D / (L1 + L2);
@@ -640,7 +641,7 @@ export class BodyModel {
     }
     const w = cW > 0 ? bendBlendWeight(bend.bend) : 0;
     const fwdPerp = perpendicularComponent(torsoFwd, this._d, this._fwdPerp) ?? anyPerpendicular(this._d, this._fwdPerp);
-    const cand = cW > 0 && isGated(L.wrist) ? flexionUp(this._d, this._child, this._flex) : null;
+    const cand = cW > 0 && this.isGated(L.wrist) ? flexionUp(this._d, this._child, this._flex) : null;
     const normal = this.acceptNormal(bend, cand, bend.bend, fwdPerp);
     blendUnit(fwdPerp, normal, w, this._u);
     const cU = w * Math.min(c, cW);
@@ -658,7 +659,7 @@ export class BodyModel {
     this.result.bendAngles[roles.upperArm] = bend.bend;
 
     // ------------------------------------------------------------- dorsal
-    const dorsal = this.dorsal(side, pose, conf, roles.lowerArm);
+    const dorsal = this.dorsal(side, pose, roles.lowerArm);
     const cHand = dorsal.c;
     const cLower = Math.min(cE, cW);
 
@@ -687,26 +688,21 @@ export class BodyModel {
 
     // ---------------------------------------------------------------- hand
     this._c.addVectors(J[L.index], J[L.pinky]).multiplyScalar(0.5).sub(Wr);
-    let cH = Math.min(cW, conf(L.index), conf(L.pinky));
+    let cH = Math.min(cW, this.conf(L.index), this.conf(L.pinky));
     if (this._c.lengthSq() < 1e-8) cH = 0;
     else this._c.normalize();
     this.finish(roles.hand, 'arms', dt, this._c, dorsal.v, cH, Math.min(cH, cHand), 'measured', forcedRelax);
 
     // ------------------------------------------------------------ shoulder
     this._a.subVectors(S, this.midShoulder);
-    let cSh = Math.min(conf(LM.LEFT_SHOULDER), conf(LM.RIGHT_SHOULDER));
+    let cSh = Math.min(this.conf(LM.LEFT_SHOULDER), this.conf(LM.RIGHT_SHOULDER));
     if (this._a.lengthSq() < 1e-8) cSh = 0;
     else this._a.normalize();
     this.finish(roles.shoulder, 'arms', dt, this._a, torsoFwd, cSh, cSh, 'measured', forcedRelax);
   }
 
   /** Dorsal (back-of-hand) normal for a side: hand tracker when present, else pose landmarks. */
-  private dorsal(
-    side: 'left' | 'right',
-    pose: FilteredPose,
-    conf: (i: number) => number,
-    prevKey: HumanoidBone,
-  ): { v: Vector3; c: number } {
+  private dorsal(side: 'left' | 'right', pose: FilteredPose, prevKey: HumanoidBone): { v: Vector3; c: number } {
     const prev = this.dorsalPrev.get(prevKey)!;
     const hand = pose.hands?.[side] ?? null;
     let n: Vector3 | null = null;
@@ -719,7 +715,7 @@ export class BodyModel {
       const L = IDX[side];
       const J = this.result.joints;
       n = dorsalNormal(J[L.wrist], J[L.index], J[L.pinky], side, this._dorsal);
-      c = n ? Math.min(conf(L.wrist), conf(L.index), conf(L.pinky)) : 0;
+      c = n ? Math.min(this.conf(L.wrist), this.conf(L.index), this.conf(L.pinky)) : 0;
     }
     if (n && c > 0) {
       prev.copy(n);
@@ -729,38 +725,30 @@ export class BodyModel {
     return { v: this._dorsal.copy(Y_UP), c: 0 };
   }
 
-  private leg(
-    side: 'left' | 'right',
-    dt: number,
-    conf: (i: number) => number,
-    isGated: (i: number) => boolean,
-    torsoFwd: Vector3,
-    noKnee: boolean,
-    forcedRelax: boolean,
-  ): void {
+  private leg(side: 'left' | 'right', dt: number, torsoFwd: Vector3, noKnee: boolean, forcedRelax: boolean): void {
     const L = IDX[side];
     const roles = ROLES[side];
     const J = this.result.joints;
     const H = J[L.hip];
     const K = J[L.knee];
     const A = J[L.ankle];
-    const cH = forcedRelax ? 0 : conf(L.hip);
-    const cK = forcedRelax ? 0 : conf(L.knee);
-    const cA = forcedRelax ? 0 : conf(L.ankle);
-    const cHe = forcedRelax ? 0 : conf(L.heel);
-    const cF = forcedRelax ? 0 : conf(L.foot);
+    const cH = forcedRelax ? 0 : this.conf(L.hip);
+    const cK = forcedRelax ? 0 : this.conf(L.knee);
+    const cA = forcedRelax ? 0 : this.conf(L.ankle);
+    const cHe = forcedRelax ? 0 : this.conf(L.heel);
+    const cF = forcedRelax ? 0 : this.conf(L.foot);
     const fb = this.limbs[side === 'left' ? 'leftLeg' : 'rightLeg'];
     const bend = this.bends.get(roles.upperLeg)!;
 
     // ------------------------------------------------- knee (with fallback)
-    const kneeUsable = isGated(L.knee) && cK > 0;
+    const kneeUsable = this.isGated(L.knee) && cK > 0;
     let c = Math.min(cH, cK);
     let source: BasisSource = 'measured';
     if (!kneeUsable) fb.lostFor += dt;
     if (!kneeUsable || cK < AMBIGUOUS_CONF) {
       const L1 = this.segmentLength('upperLeg');
       const L2 = this.segmentLength('lowerLeg');
-      if (isGated(L.hip) && isGated(L.ankle) && Number.isFinite(L1) && Number.isFinite(L2)) {
+      if (this.isGated(L.hip) && this.isGated(L.ankle) && Number.isFinite(L1) && Number.isFinite(L2)) {
         this._a.subVectors(A, H);
         const D = this._a.length();
         const r = D / (L1 + L2);
@@ -805,7 +793,7 @@ export class BodyModel {
     }
     const w = cA > 0 ? bendBlendWeight(bend.bend) : 0;
     const fwdPerp = perpendicularComponent(torsoFwd, this._d, this._fwdPerp) ?? anyPerpendicular(this._d, this._fwdPerp);
-    let cand = cA > 0 && isGated(L.ankle) ? kneecapUp(this._d, this._child, this._flex) : null;
+    let cand = cA > 0 && this.isGated(L.ankle) ? kneecapUp(this._d, this._child, this._flex) : null;
     // Knees do not hyperextend: the kneecap stays in the forward hemisphere.
     if (cand && cand.dot(torsoFwd) < 0) cand = null;
     const normal = this.acceptNormal(bend, cand, bend.bend, fwdPerp);
@@ -888,25 +876,25 @@ export class BodyModel {
     return bs.has ? bs.normal : fallback;
   }
 
+  private pushSegment(pose: FilteredPose, name: SegmentName, i: number, j: number): void {
+    if (pose.gated[i] && pose.gated[j]) this.medians.get(name)!.push(pose.world[i].distanceTo(pose.world[j]));
+  }
+
   private updateSegments(pose: FilteredPose): void {
-    const W = pose.world;
     const g = pose.gated;
-    const push = (name: SegmentName, i: number, j: number): void => {
-      if (g[i] && g[j]) this.medians.get(name)!.push(W[i].distanceTo(W[j]));
-    };
-    for (const side of ['left', 'right'] as const) {
-      const L = IDX[side];
+    for (let k = 0; k < SIDES.length; k++) {
+      const L = IDX[SIDES[k]];
       if (g[L.shoulder] && g[L.elbow] && g[L.wrist]) {
-        push('upperArm', L.shoulder, L.elbow);
-        push('lowerArm', L.elbow, L.wrist);
+        this.pushSegment(pose, 'upperArm', L.shoulder, L.elbow);
+        this.pushSegment(pose, 'lowerArm', L.elbow, L.wrist);
       }
       if (g[L.hip] && g[L.knee] && g[L.ankle]) {
-        push('upperLeg', L.hip, L.knee);
-        push('lowerLeg', L.knee, L.ankle);
+        this.pushSegment(pose, 'upperLeg', L.hip, L.knee);
+        this.pushSegment(pose, 'lowerLeg', L.knee, L.ankle);
       }
     }
-    push('shoulderWidth', LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER);
-    push('hipWidth', LM.LEFT_HIP, LM.RIGHT_HIP);
+    this.pushSegment(pose, 'shoulderWidth', LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER);
+    this.pushSegment(pose, 'hipWidth', LM.LEFT_HIP, LM.RIGHT_HIP);
     if (g[LM.LEFT_SHOULDER] && g[LM.RIGHT_SHOULDER] && g[LM.LEFT_HIP] && g[LM.RIGHT_HIP]) {
       this.medians.get('torso')!.push(this.midShoulder.distanceTo(this.midHip));
     }

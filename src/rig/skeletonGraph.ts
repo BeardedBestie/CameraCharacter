@@ -471,3 +471,24 @@ export function subtreeLength(graph: SkeletonGraph, index: number): number {
 export function hasJoints(graph: SkeletonGraph): boolean {
   return graph.nodes.some((n) => n.isJoint);
 }
+
+/** Node index per name (first occurrence wins, matching the mapping rule for duplicates). */
+export function nodeIndexByName(graph: SkeletonGraph): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const n of graph.nodes) if (!out.has(n.name)) out.set(n.name, n.index);
+  return out;
+}
+
+/**
+ * Builds the rig graph of a loaded object tree: primary skeleton selection
+ * (docs/DESIGN.md §5.2), skin weights and the graph itself. When the tree has
+ * no skinned mesh at all, every `Bone` counts as a joint (armature-only
+ * exports, synthetic test rigs) and weights are unknown.
+ *
+ * Call after {@link applyBindPose} so the rest transforms are the bind pose.
+ */
+export function buildRigGraph(root: Object3D, exclude: (obj: Object3D) => boolean = defaultExclude): SkeletonGraph {
+  const sel = selectPrimarySkeleton(root, exclude);
+  if (sel.joints.size === 0) return buildGraphFromObject3D(root, { exclude, skinnedMeshCount: sel.skinnedMeshCount, warnings: sel.warnings });
+  return buildGraphFromObject3D(root, { joints: sel.joints, weights: sel.weights, exclude, skinnedMeshCount: sel.skinnedMeshCount, warnings: sel.warnings });
+}

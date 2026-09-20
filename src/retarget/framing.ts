@@ -83,40 +83,99 @@ function bandOf(state: FramingState): [number, number] {
 }
 
 /**
- * Least-squares fit of image y against proportion heights. Returns null when
- * fewer than two distinct height classes are usable.
+ * Residual scale (in units of the user's height) of the robust fit: a landmark
+ * that sits `FIT_OUTLIER_H` off the fitted line keeps half its weight, one at
+ * twice that a fifth. A swinging ankle or a raised knee sits far above its
+ * standing proportion (and, close to the camera, perspective pushes a forward
+ * foot down the image), so it must not bend the line when it enters or
+ * leaves the frame.
  */
-export function fitHeightLine(pose: FilteredPose): { a: number; b: number } | null {
-  let n = 0;
-  let sh = 0;
-  let sy = 0;
-  let shh = 0;
-  let shy = 0;
-  let classes = 0;
-  for (const g of GROUPS) {
-    let used = false;
-    for (const i of g.indices) {
-      if (!pose.gated[i] || !pose.inFrame[i]) continue;
-      const y = pose.image[i].y;
-      if (!Number.isFinite(y)) continue;
-      n++;
-      sh += g.h;
-      sy += y;
-      shh += g.h * g.h;
-      shy += g.h * y;
-      used = true;
-    }
-    if (used) classes |= 1 << g.cls;
-  }
+export const FIT_OUTLIER_H = 0.05;
+/** Reweighting passes after the initial unweighted fit. */
+const FIT_ROBUST_PASSES = 2;
+/** Weight below which a point no longer counts toward the two-height-classes requirement. */
+const FIT_CLASS_MIN_WEIGHT = 0.25;
+
+/** Weighted least-squares accumulator over (h, y) pairs; reused between frames. */
+const _acc = { n: 0, sw: 0, sh: 0, sy: 0, shh: 0, shy: 0, classes: 0 };
+const MAX_POINTS = 64;
+const _ptH = new Float64Array(MAX_POINTS);
+const _ptY = new Float64Array(MAX_POINTS);
+const _ptW = new Float64Array(MAX_POINTS);
+const _ptCls = new Int32Array(MAX_POINTS);
+
+function clearAcc(): void {
+  const A = _acc;
+  A.n = 0;
+  A.sw = 0;
+  A.sh = 0;
+  A.sy = 0;
+  A.shh = 0;
+  A.shy = 0;
+  A.classes = 0;
+}
+
+function accumulate(h: number, y: number, w: number, cls: number): void {
+  const A = _acc;
+  A.n++;
+  A.sw += w;
+  A.sh += w * h;
+  A.sy += w * y;
+  A.shh += w * h * h;
+  A.shy += w * h * y;
+  if (w >= FIT_CLASS_MIN_WEIGHT) A.classes |= 1 << cls;
+}
+
+function solveLine(): { a: number; b: number } | null {
+  const A = _acc;
   let distinct = 0;
-  for (let c = classes; c; c >>= 1) distinct += c & 1;
-  if (n < 2 || distinct < 2) return null;
-  const det = n * shh - sh * sh;
-  if (Math.abs(det) < 1e-9) return null;
-  const a = (n * shy - sh * sy) / det;
-  const b = (sy - a * sh) / n;
+  for (let c = A.classes; c; c >>= 1) distinct += c & 1;
+  if (A.n < 2 || distinct < 2 || A.sw < 1e-9) return null;
+  const det = A.sw * A.shh - A.sh * A.sh;
+  if (Math.abs(det) < 1e-12) return null;
+  const a = (A.sw * A.shy - A.sh * A.sy) / det;
+  const b = (A.sy - a * A.sh) / A.sw;
   if (!Number.isFinite(a) || !Number.isFinite(b) || a >= -1e-6) return null; // y must decrease with height
   return { a, b };
+}
+
+/**
+ * Least-squares fit of image y against proportion heights. Returns null when
+ * fewer than two distinct height classes are usable. After the plain fit the
+ * points are reweighted by their residual (Cauchy weights with scale
+ * {@link FIT_OUTLIER_H}) and refitted, so limbs in motion do not tilt the
+ * line and the span stays continuous when they enter or leave the frame.
+ */
+export function fitHeightLine(pose: FilteredPose): { a: number; b: number } | null {
+  clearAcc();
+  let count = 0;
+  for (const g of GROUPS) {
+    for (const i of g.indices) {
+      if (!pose.gated[i] || !pose.inFrame[i] || count >= MAX_POINTS) continue;
+      const y = pose.image[i].y;
+      if (!Number.isFinite(y)) continue;
+      _ptH[count] = g.h;
+      _ptY[count] = y;
+      _ptCls[count] = g.cls;
+      count++;
+      accumulate(g.h, y, 1, g.cls);
+    }
+  }
+  let line = solveLine();
+  if (!line) return null;
+  for (let pass = 0; pass < FIT_ROBUST_PASSES; pass++) {
+    const scale = FIT_OUTLIER_H * Math.abs(line.a);
+    clearAcc();
+    for (let k = 0; k < count; k++) {
+      const r = (_ptY[k] - (line.a * _ptH[k] + line.b)) / scale;
+      _ptW[k] = 1 / (1 + r * r);
+      accumulate(_ptH[k], _ptY[k], _ptW[k], _ptCls[k]);
+    }
+    const next = solveLine();
+    if (!next) break;
+    line = next;
+  }
+  return line;
 }
 
 /**

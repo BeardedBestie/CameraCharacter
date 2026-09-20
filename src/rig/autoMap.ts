@@ -101,10 +101,18 @@ const CENTER_KEYWORD_ROLE: Record<string, HumanoidBone> = {
   head: 'head',
 };
 
+const EYE_KEYWORDS = new Set(['eye', 'eyes', 'eyeball', 'faceeye']);
+const JAW_KEYWORDS = new Set(['jaw', 'lowerjaw', 'jawroot', 'mandible']);
+
 /** Role a bone name suggests on its own (name-only candidate), or null. */
 export function nameOnlyRole(info: BoneNameInfo): HumanoidBone | null {
   if (!info.keyword) return null;
   if (info.group === 'torso') return CENTER_KEYWORD_ROLE[info.keyword] ?? null;
+  if (info.group === 'face') {
+    if (EYE_KEYWORDS.has(info.keyword) && (info.side === 'left' || info.side === 'right')) return `${info.side}Eye`;
+    if (JAW_KEYWORDS.has(info.keyword) && info.side !== 'left' && info.side !== 'right') return 'jaw';
+    return null;
+  }
   if ((info.group === 'arm' || info.group === 'leg') && (info.side === 'left' || info.side === 'right')) {
     const suffix = SIDED_KEYWORD_ROLE[info.keyword];
     if (!suffix) return null;
@@ -120,14 +128,14 @@ export function nameOnlyRole(info: BoneNameInfo): HumanoidBone | null {
 }
 
 /** Nearest mapped ancestor role in the humanoid chain. */
-function mappedParentRole(role: HumanoidBone, roleIndex: Partial<Record<HumanoidBone, number>>): HumanoidBone | null {
+export function mappedParentRole(role: HumanoidBone, roleIndex: Partial<Record<HumanoidBone, number>>): HumanoidBone | null {
   let p = HUMANOID_PARENT[role];
   while (p && roleIndex[p] === undefined) p = HUMANOID_PARENT[p];
   return p;
 }
 
 /** Mapped roles whose nearest mapped humanoid ancestor is `role`. */
-function mappedChildRoles(role: HumanoidBone, roleIndex: Partial<Record<HumanoidBone, number>>): HumanoidBone[] {
+export function mappedChildRoles(role: HumanoidBone, roleIndex: Partial<Record<HumanoidBone, number>>): HumanoidBone[] {
   const out: HumanoidBone[] = [];
   for (const b of HUMANOID_BONES) {
     if (roleIndex[b] === undefined || b === role) continue;
@@ -243,6 +251,62 @@ export function autoMapHumanoid(graph: SkeletonGraph, opts: AutoMapOptions = {})
     }
   }
 
+  return finishAutoMap(graph, topo, roleIndex, confidence, warnings, family, unrigged);
+}
+
+/** True when `value` is an {@link AutoMapResult} rather than a plain humanoid map. */
+export function isAutoMapResult(value: unknown): value is AutoMapResult {
+  return !!value && typeof value === 'object' && 'topology' in (value as AutoMapResult) && 'roleIndex' in (value as AutoMapResult);
+}
+
+/**
+ * Re-derives an {@link AutoMapResult} for an explicit role -> bone name map
+ * (a profile diff, a user override): keeps the topology, axes and family of
+ * `auto`, replaces the roles, and recomputes the required-role warnings,
+ * no-knee / no-elbow flags, forearm twist helpers and the keys. Roles whose
+ * bone does not exist are dropped with a warning; roles unchanged from the
+ * auto result keep their confidence, others get confidence 1 (user intent).
+ */
+export function remapAutoResult(graph: SkeletonGraph, auto: AutoMapResult, map: HumanoidMap): AutoMapResult {
+  const warnings = auto.warnings.filter((w) => !w.startsWith('Required roles not mapped') && !w.startsWith('No spine/chest bone mapped') && !w.startsWith('Rig has no knee joint') && !w.startsWith('Rig has no elbow joint'));
+  const byName = new Map<string, number>();
+  graph.nodes.forEach((n) => {
+    if (!byName.has(n.name)) byName.set(n.name, n.index);
+  });
+  const roleIndex: Partial<Record<HumanoidBone, number>> = {};
+  const confidence: Partial<Record<HumanoidBone, number>> = {};
+  const used = new Set<number>();
+  for (const role of HUMANOID_BONES) {
+    const name = map[role];
+    if (!name) continue;
+    const idx = byName.get(name);
+    if (idx === undefined) {
+      warnings.push(`Mapped bone '${name}' for ${role} does not exist in the model; role left unmapped.`);
+      continue;
+    }
+    if (used.has(idx)) {
+      warnings.push(`Bone '${name}' is mapped to several roles; keeping the first (${role} dropped).`);
+      continue;
+    }
+    used.add(idx);
+    roleIndex[role] = idx;
+    confidence[role] = auto.map[role] === name ? (auto.confidence[role] ?? CONF_HINT) : CONF_HINT;
+  }
+  return finishAutoMap(graph, auto.topology, roleIndex, confidence, warnings, auto.family, auto.unrigged);
+}
+
+/** Shared tail of the auto mapper: required-role checks, chain flags and keys. */
+function finishAutoMap(
+  graph: SkeletonGraph,
+  topo: TopologyResult,
+  roleIndex: Partial<Record<HumanoidBone, number>>,
+  confidence: Partial<Record<HumanoidBone, number>>,
+  warnings: string[],
+  family: RigFamily,
+  unrigged: boolean,
+): AutoMapResult {
+  const names = graph.nodes.map((n) => n.name);
+
   // 5. Required roles.
   const map: HumanoidMap = {};
   for (const role of HUMANOID_BONES) if (roleIndex[role] !== undefined) map[role] = names[roleIndex[role]!];
@@ -250,6 +314,10 @@ export function autoMapHumanoid(graph: SkeletonGraph, opts: AutoMapOptions = {})
     const missing = REQUIRED_BONES.filter((r) => map[r] === undefined);
     if (missing.length) warnings.push(`Required roles not mapped: ${missing.join(', ')}.`);
     if (!map.spine && !map.chest && !map.upperChest && map.hips) warnings.push('No spine/chest bone mapped; the torso is driven by the hips alone.');
+    if (graph.hasSkinWeights) {
+      const unweighted = (Object.keys(roleIndex) as HumanoidBone[]).filter((r) => !(graph.nodes[roleIndex[r]!].weight > 0));
+      if (unweighted.length) warnings.push(`Mapped bones without skin weight (they move nothing by themselves): ${unweighted.map((r) => `${r}='${map[r]}'`).join(', ')}.`);
+    }
   }
 
   // 6. No-knee / no-elbow chains, forearm twist helpers.

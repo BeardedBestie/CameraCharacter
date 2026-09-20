@@ -17,7 +17,7 @@ export {
   HOLD_FADE_SEC,
 } from './bodyModel';
 export type { BasisSource, MeasuredBasis, BodyModelResult, BodyModelOptions } from './bodyModel';
-export { fitFraming, fitHeightLine, stateForSpan, emptyFramingFit, FRAMING_BOUNDS } from './framing';
+export { fitFraming, fitHeightLine, stateForSpan, emptyFramingFit, FRAMING_BOUNDS, FIT_OUTLIER_H } from './framing';
 export {
   StandingBaseline,
   PoseCalibrationCapture,
@@ -27,6 +27,7 @@ export {
   effectiveTorsoBaseline,
   toBasisRecord,
   BASELINE_MIN_CONFIDENCE,
+  STANDING_BASIS_ROLES,
 } from './calibration';
 export {
   Retargeter,
