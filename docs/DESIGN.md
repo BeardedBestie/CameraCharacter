@@ -31,6 +31,8 @@ Module layout:
 
 ```
 src/
+  import/      /import/ page: frameStepper.ts, VideoPoseExtractor.ts, TakeCursor.ts, VideoTakeSource.ts,
+               CameraTrack.ts, cameraShots.ts, bake.ts, clipStore.ts, ImportApp.ts, panels/*.ts (§17)
   core/        types.ts (PoseFrame, HumanoidBone, HumanoidMap, RigAnalysis, RigProfile, Settings), math.ts
   tracking/    landmarks.ts, PoseSource.ts, MediaPipeSource.ts, WebSocketSource.ts, RecordingSource.ts,
                SyntheticSource.ts, PoseFilter.ts, convert.ts, protocol.ts, mediapipeModels.ts, camera.ts
@@ -396,3 +398,49 @@ Presets are keyed hierarchically: instance + prop id → family + prop category 
 ### 16.4 The interaction pattern
 
 This is **mixed-initiative, human-in-the-loop calibration**: the system takes the initiative with a proposal (a prior computed from conventions and analysis), the person refines it by **direct manipulation** (sliders and a gizmo rather than numbers or prompts), and the refinement is **persisted as a preset** and folded back into the proposal for the next time (learning from corrections). The same loop is used for bone roll trims, per-bone reference modes, pose calibration, and camera framing. Guidelines that follow from the pattern: the proposal must be visible and editable within seconds; every slider has a reset to the proposal; corrections are exportable and diffable against the proposal; defaults improve without retraining anything (a preset store is enough); the LLM-assisted snapshot loop (§7) is the same pattern one level up, used when the proposal itself needs new rules.
+
+## 17. Video import (`/import/`)
+
+Goal: provide video clips instead of a webcam, extract the body pose once, and play it back on any character with a camera the user controls, including keyframed camera moves for rendering. A second page (`import/index.html`, a Vite multi-page input) shares every module of the live app except its source manager and panels.
+
+### 17.1 Architecture
+
+```
+video file ─▶ <video> (detached) ─▶ frame stepper (accurate seeks) ─▶ PoseLandmarker VIDEO (+hands/face) ─▶ .mocap.json take
+                                                                                                                    │
+clip store (IndexedDB: take, thumbnail, camera track, video blob ≤ 200 MB) ◀────────────────────────────────────────┘
+                                                                                                                    │
+<video> as the clock ─▶ VideoTakeSource (TakeCursor) ─▶ PoseFilter ─▶ BodyModel ─▶ Retargeter ─▶ Stage (free / follow / keyframe camera)
+                                                        offline: bake.ts runs the same chain over the whole take ─▶ Take ─▶ GLB / BVH
+```
+
+### 17.2 Extraction
+
+`VideoPoseExtractor` loads the clip into a muted, detached `<video>` (object URL for files, `crossOrigin` for URLs), forces a duration for MediaRecorder-style WebM without one (seek far past the end), and follows a **sampling plan** (`frameStepper.planSamples`): sample k at `start + k / fps`, the last one at least half a frame before the out point, with an optional in/out range and a frame cap that lowers the rate. Each sample is an accurate seek (`currentTime = t`, wait for `seeked`) followed by `detectForVideo(video, ts)` with strictly increasing integer timestamps derived from the media time (`MonotonicTimestamps`). Landmarkers are created per extraction (VIDEO mode keeps per-instance timestamp state) with the live source's GPU → CPU fallback; hands and face use the pure converters of §11. Frames are PoseFrame v2 with `t` = media time in ms and `src = "video-import"`; the recording's `meta.video` block (new, optional, parsed leniently) records file name, duration, sample rate, size and the number of frames with a subject. Processing yields to the event loop on every seek, reports progress with an ETA and aborts through an `AbortSignal`.
+
+Why seeking rather than playing: playback-driven analysis drops frames whenever inference is slower than the clip and depends on the machine; seek stepping is deterministic, frame-accurate and independent of the clip's frame rate. Why not WebCodecs: it needs a demuxer dependency and is not available in every browser, while the media element decodes every container the browser supports (hardware decoders included).
+
+### 17.3 Playback
+
+The `<video>` element is the clock. `VideoTakeSource` polls `video.currentTime` every animation frame and emits the take frame at or before that media time, once per frame index (`TakeCursor`). Emitted timestamps are rewritten to stay monotonic across backward seeks and loops (the RecordingSource rule), so the filters never see time run backwards. Play, pause, seek, loop and speed act on the element; the picture-in-picture is the same element, so video, overlay and character always show the same instant. A clip whose video is not stored plays through `RecordingSource`; the `Transport` adapter hides the difference and emits the frame at the playhead after seeks while paused and after a pipeline reset.
+
+Defaults: mirror off (the character copies the actor's own sides), hips translation **locked** (depth from footage with a moving or zooming camera drifts; horizontal/full remain available), pose model `heavy` (offline accuracy), camera free.
+
+### 17.4 Cameras
+
+Three modes. *Free* uses OrbitControls; shot presets (`cameraShots.ts`) are framed from the rig's height table with `distanceForSpan` (full body with 15 % headroom; close-up from mid-torso to above the head; low/high angles keep the framing distance). *Follow* is the live page's follow mode. *Keyframes* drives the camera from a `CameraTrack`: time-sorted keys (position, look target, vertical FOV, easing) evaluated every frame at the transport time, with Catmull-Rom interpolation of position and target through the neighbouring keys (end neighbours reflected, so two keys interpolate linearly and end segments keep uniform speed), per-segment easing (`smooth`, `linear`, `cut`), holds outside the keys, and keys within 20 ms replacing each other. Keys are added from the current camera at the playhead (K), listed with their easing, shown as markers on the scrubber, jumped to, deleted, and persisted with the clip. `CameraTrack.orbit` generates a constant-speed orbit around the character over the clip. Tracks serialize as `{"format": "cameracharacter-camera-track", "version": 1, "keys": [...]}`.
+
+Switching from keyframes back to free keeps orbiting around the last look target; OrbitControls re-derive their spherical state from the camera position, so there is no jump.
+
+### 17.5 Baking and export
+
+`bake.ts` runs the whole take through the same pipeline objects the page uses (filter, framing, body model, standing baseline, retargeter) with each frame's own gap as `dt` (clamped like the live loop), after a one-second pre-roll of the first frame so smoothing has converged at t = 0, and samples `retargeter.sampleTake` onto the clip grid through `ClipRecorder`. It is deterministic and faster than real time; the asynchronous variant yields every N frames for the progress bar and supports cancellation. GLB (§9 exporter), BVH and the raw take are exported from the result; a take is re-baked when the clip, model, rate, mirror or translation mode changed. *Render video* seeks to the start, waits for the pose to settle, records the viewport with `VideoRecorder` (optionally the source video picture-in-picture and the clip's soundtrack through `captureStream()`), plays once with looping off and downloads at the end.
+
+### 17.6 Persistence
+
+`clipStore.ts`: IndexedDB database `cameracharacter-import` with a `clips` store (take, thumbnail, camera track, video blob when ≤ 200 MB) and a `summaries` store (name, stats, thumbnail) so listing the library never loads a take or a video. Falls back to an in-memory store. The page re-activates the most recent clip on load; the page's own settings live under `cameracharacter.import.settings.v1` with defaults that differ from the live page (§17.3).
+
+### 17.7 Testing
+
+Unit (Node): sampling plan edge cases and the monotonic timestamp rule; TakeCursor lookup, de-duplication and clock continuity across seeks and loops; camera track ordering, merging, hold/linear/smooth/cut evaluation, spline pass-through, JSON round trip and orbit generation; shot presets; baking of a static synthetic pose onto a synthetic rig (limb directions within 4° of the ground truth, pre-roll convergence, cancellation); clip store summaries and the in-memory store; URL and option parsing. End-to-end (Playwright): the page loads a take as a clip and solves it; an orbit shot moves the camera; baking resumes playback; a generated WebM clip (a figure drawn from synthetic landmarks and encoded by ffmpeg in the global setup; the open-source Chromium has no H.264 decoder) is imported through the real extractor with the self-hosted lite model, stored, and survives a reload. The `.task` bundle check accepts the two-byte prefix the Google-hosted bundles carry before the zip signature (found by this test; previously every download was rejected).
+

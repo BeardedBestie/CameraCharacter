@@ -1,9 +1,9 @@
 import type { PoseModelVariant } from '../../core/types';
-import type { AppActions, Panel, SourceKind, SourceVM } from '../actions';
+import type { Panel, SourceActions, SourceKind, SourceVM } from '../actions';
 import type { SettingsStore } from '../state';
 import { button, buttonRow, chip, el, fileDrop, hint, row, section, select, slider, textInput, toggle } from '../ui';
 
-export function createSourcePanel(store: SettingsStore, actions: AppActions): Panel<SourceVM> {
+export function createSourcePanel(store: SettingsStore, actions: SourceActions): Panel<SourceVM> {
   const sec = section('Source');
   const s = store.get();
 

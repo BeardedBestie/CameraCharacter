@@ -101,7 +101,8 @@ export interface StatusVM {
   face: boolean;
 }
 
-export interface AppActions {
+/** Source selection and playback (webcam, synthetic, recording, WebSocket). */
+export interface SourceActions {
   setSource(kind: SourceKind): Promise<void>;
   selectCamera(deviceId: string): Promise<void>;
   refreshCameras(): Promise<void>;
@@ -116,6 +117,10 @@ export interface AppActions {
     setSpeed(x: number): void;
     setLoop(v: boolean): void;
   };
+}
+
+/** Model loading, bone mapping, per-bone settings, profiles and the environment. */
+export interface ModelActions {
   loadModelFile(file: File): Promise<void>;
   loadModelUrl(url: string, label?: string): Promise<void>;
   setMappingOverride(role: HumanoidBone, boneName: string | null): void;
@@ -128,18 +133,31 @@ export interface AppActions {
   importProfile(file: File): Promise<void>;
   loadEnvironmentFile(file: File): Promise<void>;
   clearEnvironment(): void;
+}
+
+export interface CalibrationActions {
   startPoseCalibration(): Promise<void>;
   clearPoseCalibration(): void;
   resetBaseline(): void;
   takeSnapshot(): Promise<void>;
+  resetBoneSettings(): void;
+}
+
+export interface RecordingActions {
   toggleRecording(kind: 'take' | 'clip' | 'video'): Promise<void>;
   setRecordingOption(key: 'fps' | 'includeEnvironment' | 'pip' | 'microphone', value: number | boolean): void;
   exportTake(): void;
   exportClipGlb(): Promise<void>;
   exportBvh(): void;
+}
+
+export interface SettingsActions {
   resetSettings(): void;
   togglePanel(): void;
 }
+
+/** Everything the live (webcam) app offers to its panels. */
+export interface AppActions extends SourceActions, ModelActions, CalibrationActions, RecordingActions, SettingsActions {}
 
 export interface Panel<VM> {
   root: HTMLElement;

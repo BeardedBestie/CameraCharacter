@@ -1,9 +1,9 @@
 import type { CameraMode, HipsMode } from '../../core/types';
-import type { AppActions, Panel } from '../actions';
+import type { Panel } from '../actions';
 import type { SettingsStore } from '../state';
 import { hint, row, section, select, slider, textInput, toggle } from '../ui';
 
-export function createStagePanel(store: SettingsStore, _actions: AppActions): Panel<void> {
+export function createStagePanel(store: SettingsStore, _actions?: unknown): Panel<void> {
   const sec = section('Stage');
   const s = store.get();
 

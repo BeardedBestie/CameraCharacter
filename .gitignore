@@ -13,3 +13,5 @@ __pycache__/
 *.pyc
 .venv/
 public/recordings/*.mocap.json
+public/recordings/*.webm
+public/recordings/*.mp4

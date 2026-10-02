@@ -1,9 +1,9 @@
-import type { AppActions, Panel, StatusVM } from '../actions';
+import type { Panel, StatusVM } from '../actions';
 import type { SettingsStore } from '../state';
 import { chip, clear, el, section } from '../ui';
 import { roleLabel } from './ModelPanel';
 
-export function createStatusPanel(store: SettingsStore, _actions: AppActions): Panel<StatusVM> {
+export function createStatusPanel(store: SettingsStore, _actions?: unknown): Panel<StatusVM> {
   const sec = section('Status');
   const subject = chip('no subject');
   const framing = chip('framing: none');

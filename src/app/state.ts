@@ -25,20 +25,29 @@ function deepMerge<T>(base: T, patch: unknown): T {
 export class SettingsStore {
   private settings: AppSettings;
   private listeners = new Set<Listener>();
+  private readonly defaults: AppSettings;
+  private readonly key: string;
 
-  constructor(initial?: Partial<AppSettings>) {
-    this.settings = deepMerge(structuredClone(DEFAULT_SETTINGS), initial ?? {});
+  constructor(initial?: Partial<AppSettings>, opts: { key?: string; defaults?: DeepPartial<AppSettings> } = {}) {
+    this.key = opts.key ?? STORAGE_KEY;
+    this.defaults = deepMerge(structuredClone(DEFAULT_SETTINGS), opts.defaults ?? {});
+    this.settings = deepMerge(structuredClone(this.defaults), initial ?? {});
   }
 
-  static load(): SettingsStore {
+  /**
+   * Loads the persisted settings. `key` selects the localStorage entry and
+   * `defaults` override the built-in defaults (the import page uses both to
+   * keep its own, differently-defaulted settings).
+   */
+  static load(key: string = STORAGE_KEY, defaults?: DeepPartial<AppSettings>): SettingsStore {
     let stored: unknown = null;
     try {
-      const raw = globalThis.localStorage?.getItem(STORAGE_KEY);
+      const raw = globalThis.localStorage?.getItem(key);
       if (raw) stored = JSON.parse(raw);
     } catch {
       stored = null;
     }
-    return new SettingsStore(stored as Partial<AppSettings>);
+    return new SettingsStore(stored as Partial<AppSettings>, { key, defaults });
   }
 
   get(): AppSettings {
@@ -53,7 +62,7 @@ export class SettingsStore {
   }
 
   reset(): void {
-    this.settings = structuredClone(DEFAULT_SETTINGS);
+    this.settings = structuredClone(this.defaults);
     this.persist();
     for (const l of this.listeners) l(this.settings);
   }
@@ -65,7 +74,7 @@ export class SettingsStore {
 
   private persist(): void {
     try {
-      globalThis.localStorage?.setItem(STORAGE_KEY, JSON.stringify(this.settings));
+      globalThis.localStorage?.setItem(this.key, JSON.stringify(this.settings));
     } catch {
       // storage unavailable (private mode, quota): settings stay in memory
     }

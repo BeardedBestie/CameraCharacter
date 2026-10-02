@@ -1,8 +1,8 @@
-import type { AppActions, CalibrationVM, Panel } from '../actions';
+import type { CalibrationActions, CalibrationVM, Panel } from '../actions';
 import type { SettingsStore } from '../state';
 import { button, buttonRow, chip, el, hint, row, section } from '../ui';
 
-export function createCalibrationPanel(_store: SettingsStore, actions: AppActions): Panel<CalibrationVM> {
+export function createCalibrationPanel(_store: SettingsStore, actions: CalibrationActions): Panel<CalibrationVM> {
   const sec = section('Calibration');
 
   const baseline = chip('baseline: waiting');

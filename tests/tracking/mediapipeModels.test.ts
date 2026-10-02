@@ -44,6 +44,17 @@ describe('model asset table', () => {
     expect(looksLikeTaskBundle(null, HTML)).toBe(false);
     expect(looksLikeTaskBundle(null, new Uint8Array([1]))).toBe(false);
   });
+
+  it('looksLikeTaskBundle accepts the prefixed zip header of the Google-hosted bundles', () => {
+    // pose/hand/face_landmarker.task all start with two zero bytes before PK\x03\x04.
+    const prefixed = new Uint8Array([0x00, 0x00, 0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0, 0, 0, 0]);
+    expect(looksLikeTaskBundle('', prefixed)).toBe(true);
+    expect(looksLikeTaskBundle('application/octet-stream', prefixed)).toBe(true);
+    // A random binary without the signature is still rejected.
+    expect(looksLikeTaskBundle(null, new Uint8Array(100).fill(7))).toBe(false);
+    // 'PK' alone (not a local-file header) does not count.
+    expect(looksLikeTaskBundle(null, new Uint8Array([0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]))).toBe(false);
+  });
 });
 
 describe('loadModelAsset', () => {

@@ -27,6 +27,8 @@ export interface VideoRecorderOptions {
   pip?: { video: HTMLVideoElement; mirror: boolean; rect: PipRect } | null;
   /** Merge a microphone track (getUserMedia audio). Default false. */
   audio?: boolean;
+  /** Extra audio tracks to merge (e.g. a clip's soundtrack from `video.captureStream()`). */
+  audioTracks?: MediaStreamTrack[];
   /** Encoder bitrate hint (default 8 Mbit/s). */
   videoBitsPerSecond?: number;
   /** Receives human-readable warnings (hidden tab, microphone denied, patch failure). */
@@ -118,6 +120,9 @@ export class VideoRecorder {
         this.micStream = null;
         this.warn(`Microphone unavailable, recording without audio (${err instanceof Error ? err.message : String(err)})`);
       }
+    }
+    if (this.opts.audioTracks) {
+      for (const t of this.opts.audioTracks) if (t.kind === 'audio' && t.readyState === 'live') tracks.push(t);
     }
     const stream = new MediaStream(tracks);
     const mimeType = pickMimeType();

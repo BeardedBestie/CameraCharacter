@@ -251,6 +251,21 @@ export interface TrackerMeta {
   minTrackingConfidence?: number;
 }
 
+/** Provenance of a take extracted from a video file (docs/DESIGN.md §17). */
+export interface VideoMeta {
+  fileName: string;
+  /** Media duration of the source clip in ms. */
+  durationMs: number;
+  /** Sampling rate used for the extraction (frames per second of media time). */
+  sampleFps: number;
+  width: number;
+  height: number;
+  /** Size of the source file in bytes when known. */
+  sizeBytes?: number;
+  /** Frames in which a subject was detected. */
+  detectedFrames?: number;
+}
+
 export interface MocapMeta {
   createdAt: string;
   source: string;
@@ -269,6 +284,8 @@ export interface MocapMeta {
   /** The model that was driven while recording, if any. */
   referenceModel?: { familyKey: string; instanceKey?: string; displayName: string } | null;
   notes?: string;
+  /** Present when the take was extracted from a video clip (source "video-import"). */
+  video?: VideoMeta;
 }
 
 export interface MocapRecording {

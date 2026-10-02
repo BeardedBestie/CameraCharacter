@@ -34,6 +34,7 @@ export class LandmarkRecorder {
     if (meta.calibration !== undefined) filled.calibration = meta.calibration;
     if (meta.referenceModel !== undefined) filled.referenceModel = meta.referenceModel;
     if (meta.notes !== undefined) filled.notes = meta.notes;
+    if (meta.video !== undefined) filled.video = { ...meta.video };
     this.meta = filled;
     this.frames = [];
     this.recording = true;

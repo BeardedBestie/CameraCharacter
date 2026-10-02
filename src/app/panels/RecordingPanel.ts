@@ -1,4 +1,4 @@
-import type { AppActions, Panel, RecordingVM } from '../actions';
+import type { Panel, RecordingActions, RecordingVM } from '../actions';
 import type { SettingsStore } from '../state';
 import { button, buttonRow, el, hint, row, section, select, toggle } from '../ui';
 
@@ -8,7 +8,7 @@ function fmt(seconds: number): string {
   return `${m}:${s.toFixed(1).padStart(4, '0')}`;
 }
 
-export function createRecordingPanel(_store: SettingsStore, actions: AppActions): Panel<RecordingVM> {
+export function createRecordingPanel(_store: SettingsStore, actions: RecordingActions): Panel<RecordingVM> {
   const sec = section('Recording');
 
   const takeBtn = button('● Record take', () => void actions.toggleRecording('take'));

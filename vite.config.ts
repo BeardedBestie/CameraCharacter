@@ -67,6 +67,13 @@ export default defineConfig({
     target: 'es2022',
     sourcemap: true,
     chunkSizeWarningLimit: 2000,
+    rollupOptions: {
+      // Two pages: the live webcam app at / and the video importer at /import/.
+      input: {
+        main: resolve(root, 'index.html'),
+        import: resolve(root, 'import/index.html'),
+      },
+    },
   },
   optimizeDeps: {
     exclude: ['@mediapipe/tasks-vision'],

@@ -1,13 +1,13 @@
 # CameraCharacter
 
-Inhabit a 3D character from a webcam. Drop in a rigged humanoid model (Meshy, Mixamo, VRoid/VRM, Rigify, UE5, Character Creator…), stand in front of the camera, and the character moves with you. Everything runs in the browser: pose tracking (MediaPipe Tasks Vision), automatic bone mapping, retargeting, a mirror-style virtual camera, and recording of takes as re-targetable landmark data, GLB animation assets, BVH, or video.
+Inhabit a 3D character from a webcam, or transfer the motion of a video clip onto one. Drop in a rigged humanoid model (Meshy, Mixamo, VRoid/VRM, Rigify, UE5, Character Creator…), stand in front of the camera, and the character moves with you; or open [`/import/`](#importing-video-clips-import) and drop video clips to extract the body pose and play it back on the character with a free camera. Everything runs in the browser: pose tracking (MediaPipe Tasks Vision), automatic bone mapping, retargeting, a mirror-style virtual camera, and recording of takes as re-targetable landmark data, GLB animation assets, BVH, or video.
 
 Intended uses: interactive art installations, quick character puppeteering, motion-capture recording for animation, and recording actor performances inside a 3D scene as a 3D asset.
 
 > Status: version 2 is a ground-up rebuild of an earlier prototype. The design is documented in [`docs/DESIGN.md`](docs/DESIGN.md); decisions and their provenance are in [`decisionlog.md`](decisionlog.md).
 >
-> **Verified so far** (automatically, without a webcam): the TypeScript build; 313 unit tests covering the math, the filters, the auto-mapper against eleven rig families and every bundled character file, the solver on synthetic rigs and motion, framing, the mirror camera, BVH round trips and the Python provider; and a Playwright suite that boots the app in headless Chromium, loads the bundled models, drives them from synthetic motion and recorded takes, and checks bone error, framing transitions and camera behaviour.
-> **Not yet verified**: live webcam sessions (MediaPipe on real video, hand/face landmarkers, the face-matrix basis), FBX and VRM files from the wild, the pose-calibration flow, and video/GLB export inside a real browser. Open reviewer findings are listed in [`docs/REVIEW-NOTES.md`](docs/REVIEW-NOTES.md). The first live session with the diagnostic snapshot is the next step.
+> **Verified so far** (automatically, without a webcam): the TypeScript build; 350+ unit tests covering the math, the filters, the auto-mapper against eleven rig families and every bundled character file, the solver on synthetic rigs and motion, framing, the mirror camera, BVH round trips, the Python provider, and the video importer's sampling, clock, camera track and offline baking; and a Playwright suite that boots both pages in headless Chromium, loads the bundled models, drives them from synthetic motion and recorded takes, imports a generated video clip through MediaPipe, and checks bone error, framing transitions, camera behaviour and the keyframe camera.
+> **Not yet verified**: live webcam sessions (MediaPipe on real video, hand/face landmarkers, the face-matrix basis), pose extraction from real footage of people (the end-to-end test uses a drawn figure), FBX and VRM files from the wild, the pose-calibration flow, and video/GLB export inside a real browser. Open reviewer findings are listed in [`docs/REVIEW-NOTES.md`](docs/REVIEW-NOTES.md). The first live session with the diagnostic snapshot is the next step.
 
 ## What it does
 
@@ -125,6 +125,22 @@ Any humanoid with hips, a spine, a head, two arms and two legs can be driven. Mi
 | `.bvh` | humanoid hierarchy with rest offsets, root position + per-joint rotation channels | DCC mocap import (Blender, Maya, MotionBuilder) |
 | `.webm` | viewport video (optional webcam picture-in-picture) | sharing, previews |
 
+## Importing video clips (`/import/`)
+
+The second page of the app turns video clips into character animation without a webcam. Open `http://localhost:5173/import/` (the live page links to it) and drop one or more clips (`.mp4`, `.mov`, `.webm`, `.mkv`…).
+
+1. **Extraction.** Each clip is decoded by the browser itself and stepped frame by frame at a chosen sample rate (default 30 samples/s); every frame goes through the MediaPipe PoseLandmarker (default `heavy`, optional hands and face). The result is an ordinary `.mocap.json` take whose frame times are media times. Extraction is offline: it is deterministic and can be slower or faster than real time (about 30–60 frames/s on a laptop GPU with `full`; `heavy` is roughly half that). Progress and an ETA are shown; a queue handles several clips.
+2. **Library.** Clips, their takes, thumbnails and camera keyframes are stored in the browser (IndexedDB), with the video itself when it is under 200 MB, so reloading the page brings everything back. A `.mocap.json` take can also be dropped in as a clip without video.
+3. **Playback in sync.** The source video is the clock: the character, the picture-in-picture and the landmark overlay show the same instant, scrubbing included. Transport bar: play/pause (Space), frame step (← →), loop, speed.
+4. **Cameras.** *Free* (drag to orbit, wheel to zoom, right-drag to pan, with shot presets framed from the character's height: front, ¾, side, back, close-up, low, high), *Follow* (full body, pans with the character), and *Keyframes*: scrub to a time, place the camera, press **K** (or “+ camera key”); keys are shown on the scrubber, interpolated with a spline and per-key easing (smooth, linear, cut). “Add orbit shot” generates a full orbit over the clip. Camera tracks export and import as JSON.
+5. **Export.** *Bake animation* re-solves the whole clip from the first frame to the last and samples the bones (24/30/60 fps); *Export GLB* (model + animation, optional environment) and *Export BVH* bake first when needed. *Save take* writes the raw landmarks for re-targeting onto another model (here or in the live app). *Render video* plays the clip once while recording the viewport with the current camera (optionally with the source video picture-in-picture and the clip's audio).
+
+Defaults differ from the live page: the character copies the actor's own left and right (mirror off), translation is **locked** (footage from a moving or zooming camera makes depth estimates drift; switch to horizontal/full for tripod shots), and the camera is free. Bone mapping, model loading and smoothing are shared with the live page.
+
+Limitations: one person per clip; the browser must be able to decode the clip (Chrome decodes H.264 and VP9 everywhere, HEVC/H.265 from phones only where the system has a hardware decoder, so re-export those as H.264 MP4); the GLB carries no audio.
+
+URL parameters: `?video=/path/clip.webm` (import on start), `?take=/recordings/walk.mocap.json`, `?model=…`, `?fps=15` (sample rate), `?poseModel=lite|full|heavy`, `?delegate=GPU|CPU`, `?hands=1`, `?face=1`, `?camera=orbit|follow|track`, `?hips=locked|horizontal|full`, `?mirror=1`, `?autoplay=0`, `?loop=0`, `?kiosk=1`, `?diagnostics=1`.
+
 ## Protocol
 
 `WebSocketSource`, `RecordingSource` and the Python provider exchange **PoseFrame v2** JSON in raw MediaPipe conventions:
@@ -148,8 +164,10 @@ npm run typecheck    # TypeScript (strict)
 npm run test         # Vitest unit tests (math, mapping, solver, filters, exports)
 npm run build        # production build to dist/
 npm run gen:recordings   # synthetic .mocap.json takes into public/recordings/
-npm run test:e2e     # Playwright end-to-end (headless Chromium, synthetic takes)
+npm run test:e2e     # Playwright end-to-end (headless Chromium, synthetic takes, generated test clip)
 ```
+
+The end-to-end setup also renders a short WebM test clip (a figure drawn from synthetic landmarks, encoded with `ffmpeg` when it is installed) and downloads the lite pose model into `public/models/mediapipe/` when the network allows; the video import test skips when either is missing. Self-hosting the `.task` models in that folder also makes the live app work offline.
 
 Project layout:
 
@@ -162,13 +180,14 @@ src/stage       renderer, lights, mirror camera, environments
 src/record      landmark recorder, clip recorder, GLB/BVH/video export
 src/diagnostics overlays, per-bone error, snapshot bundle
 src/testing     synthetic human generator (tests, e2e, webcam-free demo source)
-src/app         UI panels and orchestration
+src/app         UI panels and orchestration of the live page
+src/import      video importer (/import/): frame stepping, extraction, video-slaved playback, camera track, baking, clip store
 backend         optional Python provider
 docs            design document
 tests, e2e      Vitest and Playwright suites
 ```
 
-Testing strategy: the math, mapping and solver are pure and tested in Node, including against the real bundled Meshy rig (read by a minimal GLB skeleton reader) and synthetic rigs; the solver is checked by generating landmarks from a synthetic human with known joint angles and asserting that the driven bones reproduce those directions. End-to-end tests load the app in headless Chromium with synthetic recordings and save screenshots.
+Testing strategy: the math, mapping and solver are pure and tested in Node, including against the real bundled Meshy rig (read by a minimal GLB skeleton reader) and synthetic rigs; the solver is checked by generating landmarks from a synthetic human with known joint angles and asserting that the driven bones reproduce those directions; offline baking is checked the same way. End-to-end tests load both pages in headless Chromium with synthetic recordings and the generated clip and save screenshots to `e2e/screenshots/`.
 
 ## Roadmap
 

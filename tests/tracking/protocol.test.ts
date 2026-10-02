@@ -168,6 +168,18 @@ describe('parseMocapRecording', () => {
     expect(cal.meta.calibration!.version).toBe(3);
   });
 
+  it('parses the video provenance block and drops an incomplete one', () => {
+    const rec = makeRecording(2) as unknown as Record<string, unknown>;
+    const meta = rec.meta as Record<string, unknown>;
+    meta.video = { fileName: 'dance.mp4', durationMs: 12_345, sampleFps: 30, width: 1920, height: 1080, sizeBytes: 123, detectedFrames: 2 };
+    const parsed = parseMocapRecording(rec);
+    expect(parsed.meta.video).toEqual({ fileName: 'dance.mp4', durationMs: 12_345, sampleFps: 30, width: 1920, height: 1080, sizeBytes: 123, detectedFrames: 2 });
+    meta.video = { fileName: 'broken.mp4', durationMs: 'x' };
+    expect(parseMocapRecording(rec).meta.video).toBeUndefined();
+    const built = buildMocapMeta({ source: 'video-import', video: { fileName: 'a.mov', durationMs: 1000, sampleFps: 24, width: 640, height: 480 } });
+    expect(built.video?.sampleFps).toBe(24);
+  });
+
   it('rejects wrong format, version, missing frames and invalid frames', () => {
     expect(() => parseMocapRecording(null)).toThrow();
     expect(() => parseMocapRecording({ format: 'other', version: 2, frames: [] })).toThrow(/format/);

@@ -1,0 +1,272 @@
+/* Import page additions on top of the shared app styles. */
+
+.import-page #pip {
+  bottom: 84px;
+  background: #0b0d12;
+}
+
+.import-page #pip .pip-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 6px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  background: repeating-linear-gradient(135deg, #0b0d12 0 12px, #11141b 12px 24px);
+}
+
+#transport {
+  position: absolute;
+  left: 16px;
+  right: calc(var(--panel-width) + 16px);
+  bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: rgba(29, 32, 39, 0.92);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  backdrop-filter: blur(6px);
+  z-index: 15;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  transition: right 0.2s ease;
+}
+
+.import-page.panel-collapsed #transport {
+  right: 16px;
+}
+
+#transport .transport-clip {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+#transport .transport-play {
+  width: 40px;
+  font-weight: 700;
+}
+
+#transport .transport-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  min-width: 120px;
+  text-align: center;
+}
+
+#transport .transport-scrub-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 120px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+}
+
+#transport .transport-scrub {
+  width: 100%;
+  margin: 0;
+}
+
+#transport .transport-markers {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 0;
+  height: 10px;
+  pointer-events: none;
+}
+
+#transport .transport-marker {
+  position: absolute;
+  top: 0;
+  width: 10px;
+  height: 10px;
+  margin-left: -5px;
+  padding: 0;
+  border: none;
+  border-radius: 2px;
+  background: var(--accent-2);
+  transform: rotate(45deg);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+#transport .transport-marker.active {
+  background: var(--warn);
+}
+
+#transport .transport-speed {
+  width: 70px;
+}
+
+#transport .transport-sep {
+  width: 1px;
+  height: 22px;
+  background: var(--border);
+}
+
+#transport .toggle {
+  white-space: nowrap;
+}
+
+/* Clip library */
+.clip-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.clip-item {
+  display: grid;
+  grid-template-columns: 64px 1fr auto;
+  gap: 8px;
+  align-items: center;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  cursor: pointer;
+}
+
+.clip-item:hover {
+  border-color: var(--accent);
+}
+
+.clip-item.active {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.clip-thumb {
+  width: 64px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 4px;
+  background: #0b0d12;
+}
+
+.clip-thumb.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+
+.clip-text {
+  min-width: 0;
+}
+
+.clip-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.clip-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.clip-delete {
+  padding: 2px 7px;
+}
+
+.processing {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+}
+
+.processing .processing-name {
+  color: var(--text);
+}
+
+/* Camera keyframes */
+.key-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.key-item {
+  display: grid;
+  grid-template-columns: 20px 1fr 90px auto;
+  gap: 6px;
+  align-items: center;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.key-item.active {
+  background: rgba(100, 210, 255, 0.12);
+}
+
+.key-index {
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
+}
+
+.key-time {
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+}
+
+.key-ease {
+  padding: 3px 6px;
+}
+
+/* Busy overlay (not used for clip import, kept for long operations) */
+#busy {
+  position: absolute;
+  left: 50%;
+  top: 16px;
+  transform: translateX(-50%);
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 320px;
+  padding: 10px 14px;
+  background: rgba(29, 32, 39, 0.95);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  z-index: 30;
+}
+
+#busy.active {
+  display: flex;
+}
+
+.progress > i.indeterminate {
+  animation: indeterminate 1.2s infinite linear;
+  width: 30% !important;
+}
+
+@keyframes indeterminate {
+  from {
+    margin-left: -30%;
+  }
+  to {
+    margin-left: 100%;
+  }
+}
+
+@media (max-width: 720px) {
+  #transport {
+    right: 16px;
+    flex-wrap: wrap;
+  }
+}

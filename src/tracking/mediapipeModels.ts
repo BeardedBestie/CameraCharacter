@@ -89,16 +89,26 @@ function defaultFetch(): FetchLike {
   return (input, init) => fetch(input, init);
 }
 
+/** Bytes searched for the zip signature at the start of a `.task` bundle. */
+export const TASK_SIGNATURE_WINDOW = 64;
+
 /**
  * True when a response plausibly holds a `.task` bundle. Dev servers answer
  * unknown paths with the SPA's index.html (status 200), so the content type
- * and the first bytes are checked: a `.task` file is a zip archive ("PK").
+ * and the first bytes are checked: a `.task` file is a zip archive, but the
+ * bundles Google hosts start with a short prefix (two zero bytes) before the
+ * `PK\x03\x04` local-file signature, so the signature is searched for within
+ * the first {@link TASK_SIGNATURE_WINDOW} bytes rather than required at 0.
  */
 export function looksLikeTaskBundle(contentType: string | null, bytes: Uint8Array): boolean {
   if (bytes.length < 4) return false;
   if (contentType && /text\/html/i.test(contentType)) return false;
   if (bytes[0] === 0x3c /* '<' */) return false;
-  return bytes[0] === 0x50 && bytes[1] === 0x4b; // 'P' 'K'
+  const end = Math.min(bytes.length - 3, TASK_SIGNATURE_WINDOW);
+  for (let i = 0; i < end; i++) {
+    if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x03 && bytes[i + 3] === 0x04) return true;
+  }
+  return false;
 }
 
 async function fetchBytes(fetchImpl: FetchLike, url: string): Promise<Uint8Array | null> {

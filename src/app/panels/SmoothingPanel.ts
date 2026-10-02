@@ -1,8 +1,8 @@
-import type { AppActions, Panel } from '../actions';
+import type { Panel, SettingsActions } from '../actions';
 import type { SettingsStore } from '../state';
 import { button, buttonRow, hint, row, section, slider } from '../ui';
 
-export function createSmoothingPanel(store: SettingsStore, actions: AppActions): Panel<void> {
+export function createSmoothingPanel(store: SettingsStore, actions: Pick<SettingsActions, 'resetSettings'>): Panel<void> {
   const sec = section('Smoothing', { collapsed: true });
   const s = store.get().smoothing;
 

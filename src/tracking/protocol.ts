@@ -16,6 +16,7 @@ import type {
   PoseFrame,
   SmoothingSettings,
   TrackerMeta,
+  VideoMeta,
 } from '../core/types';
 import { DEFAULT_SETTINGS } from '../core/types';
 import { normalizeHandednessLabel } from './convert';
@@ -234,6 +235,17 @@ function parseTrackerMeta(v: unknown): TrackerMeta | undefined {
   return out;
 }
 
+/** Video provenance block; dropped unless the required fields are present and finite. */
+function parseVideoMeta(v: unknown): VideoMeta | undefined {
+  if (!isRecord(v)) return undefined;
+  if (typeof v.fileName !== 'string') return undefined;
+  if (!isFiniteNumber(v.durationMs) || !isFiniteNumber(v.sampleFps) || !isFiniteNumber(v.width) || !isFiniteNumber(v.height)) return undefined;
+  const out: VideoMeta = { fileName: v.fileName, durationMs: v.durationMs, sampleFps: v.sampleFps, width: v.width, height: v.height };
+  if (isFiniteNumber(v.sizeBytes)) out.sizeBytes = v.sizeBytes;
+  if (isFiniteNumber(v.detectedFrames)) out.detectedFrames = v.detectedFrames;
+  return out;
+}
+
 /** Lenient: every known numeric field is taken when finite, the defaults fill the rest. */
 function parseSmoothingMeta(v: unknown): SmoothingSettings | undefined {
   if (!isRecord(v)) return undefined;
@@ -318,6 +330,8 @@ export function parseMocapMeta(metaRaw: Record<string, unknown>, frames: readonl
   } else if (ref === null) {
     meta.referenceModel = null;
   }
+  const video = parseVideoMeta(metaRaw.video);
+  if (video) meta.video = video;
   return meta;
 }
 
@@ -345,5 +359,6 @@ export function buildMocapMeta(partial: Partial<MocapMeta> = {}, now: Date = new
   if (partial.calibration !== undefined) meta.calibration = partial.calibration;
   if (partial.referenceModel !== undefined) meta.referenceModel = partial.referenceModel;
   if (partial.notes !== undefined) meta.notes = partial.notes;
+  if (partial.video !== undefined) meta.video = { ...partial.video };
   return meta;
 }

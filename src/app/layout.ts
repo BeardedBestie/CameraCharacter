@@ -54,7 +54,8 @@ export function buildLayout(root: HTMLElement, opts: { version: string }): Layou
   const countdown = el('div', { id: 'countdown' }, countdownNumber, countdownText);
 
   const panelToggle = el('button', { id: 'panel-toggle', title: 'Toggle panel (Tab)', text: '☰' });
-  const panelHeader = el('div', { id: 'panel-header' }, el('h1', { text: 'CameraCharacter' }), el('span', { text: `v${opts.version}` }));
+  const importLink = el('a', { href: '/import/', class: 'header-link', title: 'Import video clips and transfer their motion to a character', text: 'Import video →' });
+  const panelHeader = el('div', { id: 'panel-header' }, el('h1', { text: 'CameraCharacter' }), el('span', {}, importLink, ' ', el('span', { text: `v${opts.version}` })));
   const panelBody = el('div', { id: 'panel-body' });
   const panel = el('div', { id: 'panel' }, panelToggle, panelHeader, panelBody);
 

@@ -1,5 +1,5 @@
 import { BODY_BONES, type BoneRefMode, type HumanoidBone } from '../../core/types';
-import type { AppActions, MappingRow, ModelVM, Panel } from '../actions';
+import type { MappingRow, ModelActions, ModelVM, Panel } from '../actions';
 import { SAMPLE_MODELS, type SettingsStore } from '../state';
 import { button, buttonRow, clear, confidenceClass, el, fileDrop, hint, row, section, select, slider } from '../ui';
 
@@ -40,7 +40,7 @@ const MODES: { value: BoneRefMode; label: string }[] = [
   { value: 'off', label: 'off' },
 ];
 
-export function createModelPanel(store: SettingsStore, actions: AppActions): Panel<ModelVM> {
+export function createModelPanel(store: SettingsStore, actions: ModelActions): Panel<ModelVM> {
   const sec = section('Model');
   const s = store.get();
 
