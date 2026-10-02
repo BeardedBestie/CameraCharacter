@@ -7,6 +7,8 @@ export default defineConfig({
   timeout: 120_000,
   expect: { timeout: 30_000 },
   fullyParallel: false,
+  // The suite is bound by the software GL renderer; parallel workers only starve each other.
+  workers: 1,
   retries: 0,
   reporter: [['list']],
   use: {

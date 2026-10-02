@@ -35,6 +35,10 @@ type ImportWindow = Window & {
     setCameraMode(mode: 'orbit' | 'follow' | 'track'): void;
     addOrbitShot(opts: { turns: number }): void;
     bake(): Promise<void>;
+    exportGlb(): Promise<void>;
+    exportBvh(): Promise<void>;
+    exportTake(): void;
+    renderVideo(): Promise<void>;
     importVideoUrl(url: string): Promise<void>;
     selectClip(id: string): Promise<void>;
   };
@@ -129,6 +133,51 @@ test.describe('Import page (/import/)', () => {
     // Playback resumes after baking.
     const again = await waitFor(page, (st) => st.framesSolved > s.framesSolved + 10, 20_000);
     expect(again.present).toBe(true);
+  });
+
+  test('exports the baked animation as GLB and BVH and the raw take', async ({ page }) => {
+    collectConsoleErrors(page);
+    await page.goto(`/import/?take=/recordings/wave.mocap.json&model=${MODEL}&kiosk=1&autoplay=0`);
+    await waitFor(page, (st) => st.ready && !!st.model && st.clips.length === 1);
+    const glb = page.waitForEvent('download', { timeout: 90_000 });
+    await page.evaluate(() => (window as unknown as ImportWindow).cameraCharacterImport!.exportGlb());
+    const glbFile = await glb;
+    expect(glbFile.suggestedFilename()).toMatch(/sample-meshy.*wave.*\.glb$/);
+    const glbPath = await glbFile.path();
+    const { statSync, readFileSync } = await import('node:fs');
+    expect(statSync(glbPath).size).toBeGreaterThan(100_000);
+    expect(readFileSync(glbPath).subarray(0, 4).toString('ascii')).toBe('glTF');
+    const bvh = page.waitForEvent('download', { timeout: 30_000 });
+    await page.evaluate(() => (window as unknown as ImportWindow).cameraCharacterImport!.exportBvh());
+    const bvhFile = await bvh;
+    const bvhText = readFileSync(await bvhFile.path(), 'utf8');
+    expect(bvhText.startsWith('HIERARCHY')).toBe(true);
+    expect(bvhText).toMatch(/Frames:\s+\d+/);
+    const take = page.waitForEvent('download', { timeout: 30_000 });
+    await page.evaluate(() => (window as unknown as ImportWindow).cameraCharacterImport!.exportTake());
+    const takeFile = await take;
+    expect(takeFile.suggestedFilename()).toBe('wave.mocap.json');
+    const s = await state(page);
+    expect(s.hasTake).toBe(true);
+    expect(s.errors).toEqual([]);
+  });
+
+  test('renders a video of the playthrough when MediaRecorder is available', async ({ page }) => {
+    collectConsoleErrors(page);
+    await page.goto(`/import/?take=/recordings/tpose.mocap.json&model=${MODEL}&kiosk=1&autoplay=0`);
+    await waitFor(page, (st) => st.ready && !!st.model && st.clips.length === 1);
+    const supported = await page.evaluate(() => typeof MediaRecorder !== 'undefined');
+    test.skip(!supported, 'MediaRecorder unavailable in this browser');
+    const download = page.waitForEvent('download', { timeout: 60_000 });
+    await page.evaluate(() => (window as unknown as ImportWindow).cameraCharacterImport!.renderVideo());
+    await waitFor(page, (st) => st.rendering, 20_000);
+    const file = await download;
+    expect(file.suggestedFilename()).toMatch(/tpose-render.*\.(webm|mp4)$/);
+    const { statSync } = await import('node:fs');
+    expect(statSync(await file.path()).size).toBeGreaterThan(10_000);
+    const s = await waitFor(page, (st) => !st.rendering, 20_000);
+    expect(s.playback?.loop).toBe(true);
+    expect(s.errors).toEqual([]);
   });
 
   test('imports a video clip: frames are decoded, analysed and stored', async ({ page }) => {

@@ -82,8 +82,9 @@ test.describe('CameraCharacter (synthetic source)', () => {
 
   test('approach preset moves the framing state toward a close-up and zooms the mirror camera in', async ({ page }) => {
     collectConsoleErrors(page);
-    await page.goto(`/?source=synthetic&preset=approach&model=${MODEL}&autoplay=1&camera=mirror&kiosk=1&loop=0`);
-    const first = await waitFor(page, (st) => st.ready && st.framesSolved > 20);
+    // The preset loops: whatever the boot time, a full-body phase comes round before the close-up.
+    await page.goto(`/?source=synthetic&preset=approach&model=${MODEL}&autoplay=1&camera=mirror&kiosk=1&loop=1`);
+    const first = await waitFor(page, (st) => st.ready && st.framesSolved > 20 && st.framing === 'full', 60_000);
     expect(first.framing).toBe('full');
     const far = first.cameraDistance;
     const later = await waitFor(page, (st) => st.framing === 'bust' || st.framing === 'waist', 40_000);

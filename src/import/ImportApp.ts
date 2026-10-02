@@ -95,8 +95,16 @@ interface RenderJob {
   stopping: boolean;
 }
 
+/** File-system-safe base name: strips `.mocap.json` or any single extension. */
 function sanitize(name: string): string {
-  return name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9_-]+/gi, '-').toLowerCase() || 'clip';
+  return (
+    name
+      .replace(/\.mocap\.json$/i, '')
+      .replace(/\.[^.]+$/, '')
+      .replace(/[^a-z0-9_-]+/gi, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase() || 'clip'
+  );
 }
 
 function sleep(ms: number): Promise<void> {
